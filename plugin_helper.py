@@ -3,7 +3,9 @@ import base64
 import hashlib
 import ipaddress
 import json
+import logging
 import mimetypes
+import os
 import random
 import re
 import socket
@@ -13,7 +15,55 @@ from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 
 import aiohttp
-from functions import get_session, upload_file
+import deepseek_tokenizer
+from functions import count_tokens, get_session, upload_file
+
+logger = logging.getLogger("deeperseeker.compaction")
+
+
+def _env_int(name, default):
+    try:
+        return int(os.getenv(name, "") or default)
+    except (TypeError, ValueError):
+        return default
+
+
+# --- context-size compaction -------------------------------------------------
+
+# Head+tail split for clip_text: ~70% of the kept tokens come from the head.
+_CLIP_HEAD_RATIO_NUM = 7
+_CLIP_HEAD_RATIO_DEN = 10
+
+
+def _clip_text_impl(text, max_tokens, label="output"):
+    """Deterministic head+tail clip at the token level.
+
+    Returns (clipped_text, elided_tokens). If text fits the cap it is returned
+    unchanged with 0 elided. The elided middle is replaced by a marker naming
+    the measured token count so the model knows what is missing.
+    """
+    text = str(text)
+    max_tokens = int(max_tokens)
+    tokens = deepseek_tokenizer.ds_token.encode(text)
+    n = len(tokens)
+    if n <= max_tokens:
+        return text, 0
+    head_n = max(0, (max_tokens * _CLIP_HEAD_RATIO_NUM) // _CLIP_HEAD_RATIO_DEN)
+    tail_n = max(0, max_tokens - head_n)
+    if head_n + tail_n > n:
+        # Degenerate cap (tiny max_tokens): keep nothing from the middle.
+        head_n, tail_n = min(n, max_tokens), 0
+    elided = n - head_n - tail_n
+    tok = deepseek_tokenizer.ds_token
+    head = tok.decode(tokens[:head_n]) if head_n else ""
+    tail = tok.decode(tokens[n - tail_n:]) if tail_n else ""
+    marker = f"\n[... ~{elided} tokens of {label} elided ...]\n"
+    return head + marker + tail, elided
+
+
+def clip_text(text, max_tokens, label="output"):
+    """Public wrapper: clip text to ~max_tokens with a head+tail split."""
+    return _clip_text_impl(text, max_tokens, label)[0]
 
 
 async def extract_system(messages):
