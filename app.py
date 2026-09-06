@@ -165,22 +165,28 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
     else:
 
         create_lock = _sig_locks.setdefault(sig, asyncio.Lock())
-        async with create_lock:
-            sess = find_session(sig)
-            if not sess:
-                token_id = pick_token()
-                if not token_id:
-                    return JSONResponse({"error": "No tokens available"}, status_code=503)
-                tok = get_token(token_id)
-                if not tok:
-                    return JSONResponse({"error": "Token not found"}, status_code=503)
-                session_id = await create_new_chat(tok["token"])
-                save_session(sig, token_id, session_id, 0)
-                parent_message_id = 0
-            else:
-                token_id = sess["token_id"]
-                session_id = sess["session_id"]
-                parent_message_id = sess["parent_message_id"]
+        try:
+            async with create_lock:
+                sess = find_session(sig)
+                if not sess:
+                    token_id = pick_token()
+                    if not token_id:
+                        return JSONResponse({"error": "No tokens available"}, status_code=503)
+                    tok = get_token(token_id)
+                    if not tok:
+                        return JSONResponse({"error": "Token not found"}, status_code=503)
+                    session_id = await create_new_chat(tok["token"])
+                    save_session(sig, token_id, session_id, 0)
+                    parent_message_id = 0
+                else:
+                    token_id = sess["token_id"]
+                    session_id = sess["session_id"]
+                    parent_message_id = sess["parent_message_id"]
+        finally:
+            # Best-effort cleanup so the per-signature lock map doesn't grow
+            # forever; only remove it if no newer coroutine replaced the entry.
+            if _sig_locks.get(sig) is create_lock:
+                del _sig_locks[sig]
 
     tok = get_token(token_id)
     if not tok:

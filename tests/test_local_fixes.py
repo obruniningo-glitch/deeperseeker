@@ -350,6 +350,25 @@ def test_sessions_table_migrates_existing_db():
         functions._db = old_db
 
 
+def test_sig_lock_removed_after_handle_chat():
+    import unittest.mock as mock
+    import app
+    from plugin_helper import generate_signature_sync
+
+    async def run():
+        msgs = [{"role": "user", "content": "hi"}]
+        sig = generate_signature_sync(msgs, "instant")
+        # No session and no tokens available -> 503, exercising the lock path
+        with mock.patch.object(app, "get_auth_token", lambda: "tok"), \
+             mock.patch.object(app, "find_session", lambda s: None), \
+             mock.patch.object(app, "pick_token", lambda: None):
+            resp = await app.handle_chat(msgs, "instant")
+            assert resp.status_code == 503
+        assert sig not in app._sig_locks, "_sig_locks entries must be removed after use"
+
+    asyncio.run(run())
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0
