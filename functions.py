@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 import json
 import mimetypes
 import os
@@ -23,6 +24,89 @@ try:
     _TZ_OFFSET = str(int(datetime.now().astimezone().utcoffset().total_seconds()))
 except Exception:
     _TZ_OFFSET = "19800"
+
+
+_FERNET = None
+
+
+def _get_fernet():
+    """Return a Fernet instance when DEEPSEEKER_ENCRYPTION_KEY is configured.
+
+    The env var may be either a urlsafe-base64 Fernet key or an arbitrary
+    passphrase (a key is then derived via SHA-256). Returns None when the env
+    var is unset or cryptography is unavailable, in which case tokens/cookies
+    stay plaintext (legacy behavior, nothing breaks).
+    """
+    global _FERNET
+    if not os.getenv("DEEPSEEKER_ENCRYPTION_KEY"):
+        return None
+    if _FERNET is None:
+        try:
+            from cryptography.fernet import Fernet
+        except ImportError:
+            import warnings
+            warnings.warn("DEEPSEEKER_ENCRYPTION_KEY is set but the 'cryptography' "
+                          "package is not installed; tokens stay plaintext")
+            return None
+        secret = os.environ["DEEPSEEKER_ENCRYPTION_KEY"]
+        try:
+            Fernet(secret.encode("utf-8"))  # validate: already a Fernet key
+            key = secret.encode("utf-8")
+        except Exception:
+            key = base64.urlsafe_b64encode(hashlib.sha256(secret.encode("utf-8")).digest())
+        _FERNET = Fernet(key)
+    return _FERNET
+
+
+def _encrypt_secret(plaintext):
+    f = _get_fernet()
+    if f is None:
+        return plaintext
+    return f.encrypt(plaintext.encode("utf-8")).decode("ascii")
+
+
+def _decrypt_secret(stored, token_id=None):
+    """Decrypt a stored secret; legacy plaintext values are returned as-is.
+
+    When token_id is given and the value was legacy plaintext while encryption
+    is now enabled, the row is transparently re-encrypted in place.
+    """
+    f = _get_fernet()
+    if f is None or not stored or not isinstance(stored, str):
+        return stored
+    try:
+        return f.decrypt(stored.encode("utf-8")).decode("utf-8")
+    except Exception:
+        if token_id is not None:
+            try:
+                conn = get_db()
+                conn.execute("UPDATE tokens SET token = ? WHERE id = ?", (_encrypt_secret(stored), token_id))
+                conn.commit()
+                conn.close()
+            except Exception:
+                pass
+        return stored
+
+
+def _encode_cookie_value(cookie_dict):
+    payload = cookie_dict
+    f = _get_fernet()
+    if f is not None:
+        payload = f.encrypt(json.dumps(cookie_dict).encode("utf-8")).decode("ascii")
+    return payload
+
+
+def _decode_cookie_value(stored):
+    """Inverse of _encode_cookie_value; a plaintext dict (legacy file) passes through."""
+    if isinstance(stored, dict):
+        return stored
+    f = _get_fernet()
+    if f is None or not isinstance(stored, str):
+        return None
+    try:
+        return json.loads(f.decrypt(stored.encode("utf-8")).decode("utf-8"))
+    except Exception:
+        return None
 
 
 def get_db():
@@ -104,8 +188,9 @@ async def get_cookies():
         if os.path.exists("aws_cookies_deepseek.json"):
             with open("aws_cookies_deepseek.json") as f:
                 cookies = json.load(f)
-            if cookies.get("expiry") is not None and cookies["expiry"] > time.time():
-                return cookies["cookie"]
+            cookie = _decode_cookie_value(cookies.get("cookie"))
+            if cookies.get("expiry") is not None and cookies["expiry"] > time.time() and cookie is not None:
+                return cookie
     except Exception:
         pass
     async with _cookie_lock:
@@ -114,14 +199,18 @@ async def get_cookies():
             if os.path.exists("aws_cookies_deepseek.json"):
                 with open("aws_cookies_deepseek.json") as f:
                     cookies = json.load(f)
-                fresh = cookies.get("expiry") is not None and cookies["expiry"] > time.time()
+                fresh = cookies.get("expiry") is not None and cookies["expiry"] > time.time() \
+                    and _decode_cookie_value(cookies.get("cookie")) is not None
         except Exception:
             fresh = False
         if not fresh:
             await _generate_cookies()
         with open("aws_cookies_deepseek.json") as f:
             cookies = json.load(f)
-        return cookies["cookie"]
+        cookie = _decode_cookie_value(cookies.get("cookie"))
+        if cookie is None:
+            raise Exception("unable to decode stored DeepSeek cookies")
+        return cookie
 
 
 async def _generate_cookies():
@@ -153,16 +242,16 @@ async def _generate_cookies():
         expiry = time.time() + 1800
     tmp_path = "aws_cookies_deepseek.json.tmp"
     with open(tmp_path, "w") as f:
-        f.write(json.dumps({"cookie": final_cookies, "expiry": expiry}))
+        f.write(json.dumps({"cookie": _encode_cookie_value(final_cookies), "expiry": expiry}))
     os.replace(tmp_path, "aws_cookies_deepseek.json")
 
 
 def get_auth_token():
     conn = get_db()
-    row = conn.execute("SELECT token FROM tokens LIMIT 1").fetchone()
+    row = conn.execute("SELECT id, token FROM tokens LIMIT 1").fetchone()
     conn.close()
     if row:
-        return row[0]
+        return _decrypt_secret(row[1], row[0])
     return None
 
 
@@ -178,7 +267,7 @@ def add_token(token, alias=None):
             WHERE t2.id IS NULL
         """).fetchone()
         next_id = row[0] if row and row[0] else 1
-    conn.execute("INSERT INTO tokens (id, alias, token, status) VALUES (?, ?, ?, 'ACTIVE')", (next_id, alias, token))
+    conn.execute("INSERT INTO tokens (id, alias, token, status) VALUES (?, ?, ?, 'ACTIVE')", (next_id, alias, _encrypt_secret(token)))
     conn.commit()
     conn.close()
 
@@ -187,7 +276,7 @@ def get_tokens():
     conn = get_db()
     rows = conn.execute("SELECT id, alias, token, status FROM tokens").fetchall()
     conn.close()
-    return [{"id": r[0], "alias": r[1], "token": r[2], "status": r[3]} for r in rows]
+    return [{"id": r[0], "alias": r[1], "token": _decrypt_secret(r[2], r[0]), "status": r[3]} for r in rows]
 
 
 def get_token(token_id):
@@ -195,7 +284,7 @@ def get_token(token_id):
     row = conn.execute("SELECT id, alias, token, status FROM tokens WHERE id = ?", (token_id,)).fetchone()
     conn.close()
     if row:
-        return {"id": row[0], "alias": row[1], "token": row[2], "status": row[3]}
+        return {"id": row[0], "alias": row[1], "token": _decrypt_secret(row[2], row[0]), "status": row[3]}
     return None
 
 

@@ -198,6 +198,97 @@ def test_fetch_url_bytes_validates_every_redirect_hop():
     asyncio.run(run())
 
 
+def _temp_db(monkeypatched_env):
+    import tempfile
+    import unittest.mock as mock
+    import functions
+    tmp = tempfile.mkdtemp(prefix="ds_test_")
+    db = os.path.join(tmp, "test.db")
+    cm = mock.patch.dict(os.environ, monkeypatched_env)
+    cm.start()
+    functions._FERNET = None
+    old_db = functions._db
+    functions._db = db
+    return db, old_db, cm
+
+
+def _restore_db(old_db, cm):
+    import functions
+    functions._db = old_db
+    functions._FERNET = None
+    cm.stop()
+
+
+def test_token_encrypted_at_rest_and_decrypted_on_read():
+    import sqlite3
+    import functions
+    db, old_db, cm = _temp_db({"DEEPSEEKER_ENCRYPTION_KEY": "test-passphrase"})
+    try:
+        functions.init_db()
+        functions.add_token("sk-secret-deepseek-token", "t1")
+        conn = sqlite3.connect(db)
+        stored = conn.execute("SELECT token FROM tokens WHERE id = 1").fetchone()[0]
+        conn.close()
+        assert "sk-secret-deepseek-token" not in stored, "token must not be stored in plaintext"
+        assert functions.get_token(1)["token"] == "sk-secret-deepseek-token"
+        assert functions.get_auth_token() == "sk-secret-deepseek-token"
+        assert [t["token"] for t in functions.get_tokens()] == ["sk-secret-deepseek-token"]
+    finally:
+        _restore_db(old_db, cm)
+
+
+def test_legacy_plaintext_token_migrates_on_read():
+    import sqlite3
+    import functions
+    db, old_db, cm = _temp_db({"DEEPSEEKER_ENCRYPTION_KEY": "test-passphrase"})
+    try:
+        functions.init_db()
+        conn = sqlite3.connect(db)
+        conn.execute("INSERT INTO tokens (id, alias, token, status) VALUES (1, 'legacy', 'plain-legacy-token', 'ACTIVE')")
+        conn.commit()
+        conn.close()
+        # read returns the working token and transparently re-encrypts the row
+        assert functions.get_token(1)["token"] == "plain-legacy-token"
+        conn = sqlite3.connect(db)
+        stored = conn.execute("SELECT token FROM tokens WHERE id = 1").fetchone()[0]
+        conn.close()
+        assert "plain-legacy-token" not in stored, "legacy plaintext row must be re-encrypted on read"
+        assert functions.get_token(1)["token"] == "plain-legacy-token"
+    finally:
+        _restore_db(old_db, cm)
+
+
+def test_tokens_stay_plaintext_without_encryption_key():
+    import sqlite3
+    import functions
+    db, old_db, cm = _temp_db({})
+    try:
+        functions.init_db()
+        functions.add_token("sk-plain-token", "t1")
+        conn = sqlite3.connect(db)
+        stored = conn.execute("SELECT token FROM tokens WHERE id = 1").fetchone()[0]
+        conn.close()
+        assert stored == "sk-plain-token", "without DEEPSEEKER_ENCRYPTION_KEY behavior must stay plaintext"
+        assert functions.get_token(1)["token"] == "sk-plain-token"
+    finally:
+        _restore_db(old_db, cm)
+
+
+def test_cookie_value_encryption_roundtrip():
+    import unittest.mock as mock
+    import functions
+    with mock.patch.dict(os.environ, {"DEEPSEEKER_ENCRYPTION_KEY": "another-pass"}):
+        functions._FERNET = None
+        try:
+            payload = functions._encode_cookie_value({"aws-waf-token": "abc123"})
+            assert isinstance(payload, str) and "abc123" not in payload
+            assert functions._decode_cookie_value(payload) == {"aws-waf-token": "abc123"}
+            # legacy plaintext dict still decodes
+            assert functions._decode_cookie_value({"a": "b"}) == {"a": "b"}
+        finally:
+            functions._FERNET = None
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0
