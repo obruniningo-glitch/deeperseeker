@@ -133,6 +133,7 @@ def init_db():
             token_id INTEGER,
             deepseek_session_id TEXT,
             parent_message_id INTEGER DEFAULT 0,
+            hist_len INTEGER,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS session_map (
@@ -148,6 +149,13 @@ def init_db():
     try:
         conn.execute("ALTER TABLE sessions ADD COLUMN created_at TIMESTAMP")
         conn.execute("UPDATE sessions SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL")
+        conn.commit()
+    except Exception:
+        pass
+    # Migrate pre-existing databases that lack the sessions.hist_len column
+    # (signature-tolerance length guard). Nullable; NULL rows bypass the guard.
+    try:
+        conn.execute("ALTER TABLE sessions ADD COLUMN hist_len INTEGER")
         conn.commit()
     except Exception:
         pass
@@ -358,21 +366,21 @@ def mark_active(token_id):
 
 def find_session(sig):
     conn = get_db()
-    row = conn.execute("SELECT token_id, deepseek_session_id, parent_message_id FROM sessions WHERE signature = ?", (sig,)).fetchone()
+    row = conn.execute("SELECT token_id, deepseek_session_id, parent_message_id, hist_len FROM sessions WHERE signature = ?", (sig,)).fetchone()
     conn.close()
     if row:
-        return {"token_id": row[0], "session_id": row[1], "parent_message_id": row[2]}
+        return {"token_id": row[0], "session_id": row[1], "parent_message_id": row[2], "hist_len": row[3]}
     return None
 
 
-def save_session(sig, token_id, session_id, parent_message_id=0):
+def save_session(sig, token_id, session_id, parent_message_id=0, hist_len=None):
     conn = get_db()
     # created_at is set explicitly (not via column DEFAULT) so rows are stamped
     # even in databases migrated with ALTER TABLE, where no DEFAULT exists.
     conn.execute(
-        """INSERT OR REPLACE INTO sessions (signature, token_id, deepseek_session_id, parent_message_id, created_at)
-           VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)""",
-        (sig, token_id, session_id, parent_message_id),
+        """INSERT OR REPLACE INTO sessions (signature, token_id, deepseek_session_id, parent_message_id, hist_len, created_at)
+           VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+        (sig, token_id, session_id, parent_message_id, hist_len),
     )
     conn.commit()
     conn.close()
@@ -756,25 +764,6 @@ class StreamToolParser:
             pass
         self.buffer = ""
         return out
-
-
-def summarize_messages(messages, max_tokens=500):
-    recent = messages[-10:] if len(messages) > 10 else messages
-    parts = []
-    for msg in recent:
-        role = msg.get("role", "unknown")
-        content = msg.get("content", "")
-        if isinstance(content, list):
-            content = " ".join(c.get("text", "") for c in content if c.get("type") == "text")
-        if content:
-            parts.append(f"{role}: {content[:200]}")
-    summary = "\n".join(parts)
-    tokens = count_tokens(summary)
-    while tokens > max_tokens and len(parts) > 1:
-        parts = parts[1:]
-        summary = "\n".join(parts)
-        tokens = count_tokens(summary)
-    return summary
 
 
 _pow_setup = None
