@@ -146,6 +146,58 @@ def test_stream_flush_discards_partial_tool_call():
     assert out == [], "a stream cut off mid-tool-call must not leak raw XML fragments as text"
 
 
+def test_fetch_url_bytes_validates_every_redirect_hop():
+    import unittest.mock as mock
+    from aiohttp import web
+    import functions
+    import plugin_helper
+
+    async def run():
+        async def final(request):
+            return web.Response(body=b"image-bytes")
+
+        async def redir(request):
+            raise web.HTTPFound("/final")
+
+        async def loop(request):
+            raise web.HTTPFound("/loop")
+
+        a = web.Application()
+        a.router.add_get("/final", final)
+        a.router.add_get("/redir", redir)
+        a.router.add_get("/loop", loop)
+        runner = web.AppRunner(a)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = runner.addresses[0][1]
+        base = f"http://127.0.0.1:{port}"
+        session = await functions.get_session()
+        try:
+            with mock.patch.object(plugin_helper, "_assert_public_url", lambda u: None):
+                # a redirect chain is followed hop by hop
+                data = await plugin_helper._fetch_url_bytes(session, base + "/redir")
+                assert data == b"image-bytes"
+                # a redirect loop is capped instead of hanging
+                try:
+                    await plugin_helper._fetch_url_bytes(session, base + "/loop")
+                    raise AssertionError("redirect loop must be capped")
+                except ValueError as e:
+                    assert "redirect" in str(e)
+            # without the patch, a non-public address must be rejected
+            try:
+                await plugin_helper._fetch_url_bytes(session, base + "/redir")
+                raise AssertionError("non-public address must be rejected")
+            except ValueError:
+                pass
+        finally:
+            await runner.cleanup()
+            await session.close()
+            functions._session = None
+
+    asyncio.run(run())
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0

@@ -10,7 +10,7 @@ import socket
 import string
 import uuid
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 import aiohttp
 from functions import get_session, upload_file
@@ -78,6 +78,33 @@ def _assert_public_url(url):
             raise ValueError("url resolves to non-public address")
 
 
+async def _fetch_url_bytes(session, url, max_bytes=20 * 1024 * 1024 + 1, max_redirects=5):
+    """Fetch a URL with redirects followed manually so every hop is re-checked
+    against _assert_public_url (a redirect must not bypass the SSRF guard).
+
+    Residual risk: DNS-rebinding TOCTOU — _assert_public_url resolves the host
+    for validation, but aiohttp re-resolves independently when connecting, so
+    an attacker controlling DNS could still serve a private IP at connect time.
+    Full IP-pinning is out of scope here.
+    """
+    current_url = url
+    for _ in range(max_redirects + 1):
+        _assert_public_url(current_url)
+        async with session.get(
+            current_url,
+            allow_redirects=False,
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            if resp.status in (301, 302, 303, 307, 308):
+                location = resp.headers.get("Location")
+                if not location:
+                    raise ValueError("redirect response without Location header")
+                current_url = urljoin(current_url, location)
+                continue
+            return await resp.content.read(max_bytes)
+    raise ValueError("too many redirects while fetching url")
+
+
 def _b64(data):
     data = re.sub(r"[^A-Za-z0-9+/=]", "", data)
     try:
@@ -110,8 +137,7 @@ async def extract_and_upload_files(messages, auth_token, last_user_only=False):
                     filename = Path(url_path).name
                     mime_type, _ = mimetypes.guess_type(filename)
                     session = await get_session()
-                    async with session.get(j["image_url"]["url"]) as resp:
-                        file_bytes = await resp.content.read(20 * 1024 * 1024 + 1)
+                    file_bytes = await _fetch_url_bytes(session, j["image_url"]["url"])
                     if len(file_bytes) > 20 * 1024 * 1024:
                         continue
 
