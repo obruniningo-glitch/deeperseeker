@@ -289,6 +289,67 @@ def test_cookie_value_encryption_roundtrip():
             functions._FERNET = None
 
 
+def test_sessions_have_created_at_and_are_pruned_by_ttl():
+    import sqlite3
+    import functions
+    db, old_db, cm = _temp_db({"DEEPSEEKER_SESSION_TTL_DAYS": "7"})
+    try:
+        functions.init_db()
+        functions.save_session("sig-fresh", 1, "ds1", 2)
+        conn = sqlite3.connect(db)
+        created = conn.execute("SELECT created_at FROM sessions WHERE signature = 'sig-fresh'").fetchone()
+        assert created and created[0], "sessions must record created_at"
+        # simulate an old session, then prune
+        conn.execute("UPDATE sessions SET created_at = datetime('now', '-8 days') WHERE signature = 'sig-fresh'")
+        conn.commit()
+        conn.close()
+        functions.prune_sessions(7)
+        assert functions.find_session("sig-fresh") is None, "sessions older than the TTL must be pruned"
+        # save_session also prunes stale rows as a side effect
+        conn = sqlite3.connect(db)
+        conn.execute("INSERT INTO sessions (signature, token_id, deepseek_session_id, parent_message_id, created_at) VALUES ('sig-stale', 1, 'ds2', 0, datetime('now', '-30 days'))")
+        conn.commit()
+        conn.close()
+        functions.save_session("sig-new", 1, "ds3", 4)
+        assert functions.find_session("sig-stale") is None
+        assert functions.find_session("sig-new") is not None
+    finally:
+        _restore_db(old_db, cm)
+
+
+def test_sessions_table_migrates_existing_db():
+    import sqlite3
+    import tempfile
+    import functions
+    tmp = tempfile.mkdtemp(prefix="ds_test_")
+    db = os.path.join(tmp, "legacy.db")
+    conn = sqlite3.connect(db)
+    conn.executescript("""
+        CREATE TABLE sessions (
+            signature TEXT PRIMARY KEY,
+            token_id INTEGER,
+            deepseek_session_id TEXT,
+            parent_message_id INTEGER DEFAULT 0
+        );
+        INSERT INTO sessions (signature, token_id, deepseek_session_id, parent_message_id)
+            VALUES ('legacy-row', 1, 'ds', 0);
+    """)
+    conn.commit()
+    conn.close()
+    old_db = functions._db
+    functions._db = db
+    try:
+        functions.init_db()
+        conn = sqlite3.connect(db)
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(sessions)").fetchall()]
+        created = conn.execute("SELECT created_at FROM sessions WHERE signature = 'legacy-row'").fetchone()
+        conn.close()
+        assert "created_at" in cols, "init_db must ALTER TABLE the legacy sessions table"
+        assert created and created[0], "legacy rows must get a created_at stamp"
+    finally:
+        functions._db = old_db
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0

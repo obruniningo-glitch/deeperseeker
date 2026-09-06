@@ -132,7 +132,8 @@ def init_db():
             signature TEXT PRIMARY KEY,
             token_id INTEGER,
             deepseek_session_id TEXT,
-            parent_message_id INTEGER DEFAULT 0
+            parent_message_id INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS session_map (
             old_session TEXT PRIMARY KEY,
@@ -141,8 +142,43 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     """)
+    # Migrate pre-existing databases that lack the sessions.created_at column.
+    # (SQLite cannot ALTER TABLE ADD COLUMN with a non-constant DEFAULT, so the
+    # column is added plain and existing rows are stamped explicitly.)
+    try:
+        conn.execute("ALTER TABLE sessions ADD COLUMN created_at TIMESTAMP")
+        conn.execute("UPDATE sessions SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL")
+        conn.commit()
+    except Exception:
+        pass
     conn.commit()
     conn.close()
+    prune_sessions()
+
+
+def session_ttl_days():
+    """Configured session TTL in days (DEEPSEEKER_SESSION_TTL_DAYS, default 7)."""
+    try:
+        return float(os.getenv("DEEPSEEKER_SESSION_TTL_DAYS", "7"))
+    except (TypeError, ValueError):
+        return 7.0
+
+
+def prune_sessions(max_age_days=None):
+    """Delete sessions older than the TTL (cheap DELETE on the same DB)."""
+    if max_age_days is None:
+        max_age_days = session_ttl_days()
+    conn = get_db()
+    try:
+        conn.execute(
+            "DELETE FROM sessions WHERE created_at IS NOT NULL AND created_at < datetime('now', ?)",
+            (f"-{max_age_days} days",),
+        )
+        conn.commit()
+    except Exception:
+        pass
+    finally:
+        conn.close()
 
 
 async def get_session():
@@ -331,13 +367,16 @@ def find_session(sig):
 
 def save_session(sig, token_id, session_id, parent_message_id=0):
     conn = get_db()
+    # created_at is set explicitly (not via column DEFAULT) so rows are stamped
+    # even in databases migrated with ALTER TABLE, where no DEFAULT exists.
     conn.execute(
-        """INSERT OR REPLACE INTO sessions (signature, token_id, deepseek_session_id, parent_message_id)
-           VALUES (?, ?, ?, ?)""",
+        """INSERT OR REPLACE INTO sessions (signature, token_id, deepseek_session_id, parent_message_id, created_at)
+           VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)""",
         (sig, token_id, session_id, parent_message_id),
     )
     conn.commit()
     conn.close()
+    prune_sessions()
 
 
 def delete_session(sig):
