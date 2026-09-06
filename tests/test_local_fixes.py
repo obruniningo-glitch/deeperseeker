@@ -98,6 +98,17 @@ def test_user_text_after_tool_result_preserved():
     assert out[2]["content"] == "now list the hidden files"
 
 
+def test_next_parent_helper_is_centralized():
+    import functions
+    import inspect
+    import app
+    assert functions.next_parent(0) == 2
+    assert functions.next_parent(4) == 6
+    # every save_session call in app.py must go through next_parent
+    assert "parent_message_id + 2" not in inspect.getsource(app), \
+        "parent_message_id bookkeeping must use the centralized next_parent() helper"
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0
