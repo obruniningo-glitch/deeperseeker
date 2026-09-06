@@ -94,6 +94,10 @@ def get_current_admin(request: Request):
     SESSIONS[sid] = time.time()
     origin = request.headers.get("origin", "")
     if origin:
+        # Browsers send "Origin: null" for sandboxed/privacy-sensitive contexts;
+        # it can never legitimately match our host, so reject it outright.
+        if origin.strip().lower() == "null":
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
         parsed = urlparse(origin).netloc
         if parsed and parsed != request.headers.get("host", ""):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
@@ -1153,4 +1157,7 @@ async def health(request: Request):
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host=os.getenv("HOST", "0.0.0.0"), port=int(os.getenv("PORT", "4000")))
+    # Default to loopback: the README documents http://127.0.0.1:4000 and the
+    # admin dashboard has no business being exposed to the network by default.
+    # Set HOST=0.0.0.0 explicitly to listen on all interfaces.
+    uvicorn.run(app, host=os.getenv("HOST", "127.0.0.1"), port=int(os.getenv("PORT", "4000")))

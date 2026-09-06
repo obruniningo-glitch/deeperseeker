@@ -378,6 +378,46 @@ def test_outbound_calls_have_explicit_timeouts():
     assert "ClientTimeout(total=120)" in src, "get_file_content signed-URL download must have a total=120 timeout"
 
 
+def test_get_current_admin_rejects_null_origin():
+    import time
+    import app
+    from starlette.requests import Request
+
+    app.SESSIONS["testsid"] = time.time()
+
+    def make_request(origin_header):
+        headers = [(b"cookie", b"session_id=testsid")]
+        if origin_header is not None:
+            headers.append((b"origin", origin_header))
+        headers.append((b"host", b"127.0.0.1:4000"))
+        return Request({"type": "http", "headers": headers})
+
+    try:
+        for bad_origin in (b"null", b"NULL"):
+            try:
+                app.get_current_admin(make_request(bad_origin))
+                raise AssertionError(f"Origin: {bad_origin.decode()} must be rejected")
+            except Exception as e:
+                assert getattr(e, "status_code", None) == 403, f"Origin: {bad_origin.decode()} must be 403"
+        # cross-origin is still rejected
+        try:
+            app.get_current_admin(make_request(b"http://evil.example.com"))
+            raise AssertionError("cross-origin must be rejected")
+        except Exception as e:
+            assert getattr(e, "status_code", None) == 403
+        # same-origin admin still works
+        assert app.get_current_admin(make_request(b"http://127.0.0.1:4000")) == "admin"
+    finally:
+        app.SESSIONS.pop("testsid", None)
+
+
+def test_uvicorn_defaults_to_loopback():
+    import inspect
+    import app
+    src = inspect.getsource(app)
+    assert 'os.getenv("HOST", "127.0.0.1")' in src, "uvicorn must default to 127.0.0.1, not 0.0.0.0"
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0
