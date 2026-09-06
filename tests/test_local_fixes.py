@@ -109,6 +109,34 @@ def test_next_parent_helper_is_centralized():
         "parent_message_id bookkeeping must use the centralized next_parent() helper"
 
 
+def test_parse_tools_ignores_tool_markup_in_code_fence():
+    text = 'Here is an example:\n```xml\n<tool_call name="Bash">{"command":"rm -rf /"}</tool_call>\n```\nAll done!'
+    tools, clean_text = parse_tools(text)
+    assert tools == [], "tool-call markup inside a markdown code fence must not be parsed as a real tool call"
+
+
+def test_parse_tools_still_finds_call_after_fenced_example():
+    text = ('Example:\n```\n<tool_call>{"name": "Bash"}</tool_call>\n```\n'
+            'Now really do it.\n<tool_call>{"name": "Bash", "arguments": {"command": "ls"}}</tool_call>')
+    tools, clean_text = parse_tools(text)
+    assert len(tools) == 1, "a real tool call outside the fence must still be parsed"
+    assert tools[0]["function"]["name"] == "Bash"
+
+
+def test_parse_tools_keeps_repeated_identical_calls():
+    call = '<tool_call>{"name": "Read", "arguments": {"path": "a.txt"}}</tool_call>'
+    tools, clean_text = parse_tools(call + call)
+    assert len(tools) == 2, "legitimately repeated identical tool calls must not be deduped away"
+    assert tools[0]["id"] != tools[1]["id"]
+
+
+def test_parse_tools_preserves_companion_text():
+    text = 'Let me check that for you.\n<tool_call>{"name": "Bash", "arguments": {"command": "ls"}}</tool_call>'
+    tools, clean_text = parse_tools(text)
+    assert tools, "the tool call must still be found"
+    assert clean_text == "Let me check that for you.", "text accompanying a tool call must be preserved"
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0
