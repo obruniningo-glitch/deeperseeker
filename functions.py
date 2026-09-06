@@ -623,9 +623,9 @@ class StreamToolParser:
         if self.buffer and not self.in_tool:
             out.append({"text": self.buffer})
         elif self.in_tool:
-            stripped = re.sub(r"</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?(?:tool_call|invoke|function_call|parameter)[^>]*>", "", self.buffer, flags=re.IGNORECASE).strip()
-            if stripped:
-                out.append({"text": stripped})
+            # Stream ended mid-tool-call: discard the partial tool content
+            # silently. Emitting it would leak raw XML fragments as text.
+            pass
         self.buffer = ""
         return out
 

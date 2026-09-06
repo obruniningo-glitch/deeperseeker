@@ -137,6 +137,15 @@ def test_parse_tools_preserves_companion_text():
     assert clean_text == "Let me check that for you.", "text accompanying a tool call must be preserved"
 
 
+def test_stream_flush_discards_partial_tool_call():
+    from functions import StreamToolParser
+    p = StreamToolParser()
+    p.feed("here is the plan: ")
+    p.feed('<tool_call>{"name": "Bash", "arguments": {"comm')
+    out = p.flush()
+    assert out == [], "a stream cut off mid-tool-call must not leak raw XML fragments as text"
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0
