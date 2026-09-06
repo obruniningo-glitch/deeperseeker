@@ -153,8 +153,9 @@ def from_ir(conv: Conversation) -> dict[str, Any]:
                         entry["name"] = b.name
                     msgs.append(entry)
             continue
-        # user (or degraded shapes): parts list when images present, else str
-        has_media = any(isinstance(b, (ImageBlock, FileBlock)) for b in m.blocks)
+        # user (or degraded shapes): parts list when any block needs the parts
+        # representation (media or dialect-specific unknowns), else plain string
+        has_media = any(isinstance(b, (ImageBlock, FileBlock, UnknownBlock)) for b in m.blocks)
         if has_media:
             parts: list[dict[str, Any]] = []
             for b in m.blocks:

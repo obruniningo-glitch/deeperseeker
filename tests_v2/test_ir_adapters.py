@@ -110,6 +110,31 @@ def test_unknown_wire_types_roundtrip_losslessly():
     assert wire["messages"][0]["content"][0]["type"] == "web_search_result"
 
 
+def test_unknown_block_only_user_message_openai():
+    """Regression: from_ir dropped UnknownBlock when the user message had no
+    Image/File block (parts-list branch was gated on media only)."""
+    body = {"messages": [{"role": "user", "content": [
+        {"type": "custom_thing", "payload": 1}]}]}
+    conv = adapters.to_ir(body, "openai")
+    assert isinstance(conv.messages[0].blocks[0], UnknownBlock)
+    back = adapters.to_ir(adapters.from_ir(conv, "openai"), "openai")
+    assert back == conv
+
+
+def test_canonicalize_idempotent_mixed_blocks():
+    """Regression: merge ran before sort, so two ThinkingBlocks separated by a
+    ToolUseBlock became adjacent after sorting but never merged; a second
+    canonicalize call produced a different conversation."""
+    msg = Message(role="assistant", blocks=(
+        ThinkingBlock(text="a"), TextBlock(text="b"), TextBlock(text="c"),
+        ToolUseBlock(id="t1", name="Bash", arguments={}), ThinkingBlock(text="d")))
+    conv = canonicalize_conversation(Conversation(system=None, messages=(msg,), metadata={}))
+    assert canonicalize_conversation(conv) == conv
+    blocks = conv.messages[0].blocks
+    assert [type(b).__name__ for b in blocks] == ["ToolUseBlock", "TextBlock", "ThinkingBlock"]
+    assert blocks[1].text == "b\nc" and blocks[2].text == "a\nd"
+
+
 def test_ir_version_and_metadata():
     conv = adapters.to_ir({"messages": [{"role": "user", "content": "hi"}],
                            "temperature": 0.3, "seed": 7}, "openai")
@@ -166,12 +191,6 @@ tool_names = st.sampled_from(["Bash", "Read", "Edit", "WebSearch"])
 args_dicts = st.dictionaries(st.sampled_from(["command", "path", "query"]),
                              st.text(min_size=0, max_size=40), max_size=3)
 
-representable_blocks = st.one_of(
-    st.builds(TextBlock, text=block_str),
-    st.builds(ToolUseBlock, id=tool_ids, name=tool_names, arguments=args_dicts),
-    st.builds(ThinkingBlock, text=block_str),
-)
-
 # Assistant message: at most one TextBlock, multiple ToolUseBlocks, optional one ThinkingBlock
 # Build as: (tool_calls...) + (text?) + (thinking?)
 assistant_tool_calls = st.lists(
@@ -193,14 +212,8 @@ assistant_blocks = st.tuples(assistant_tool_calls, assistant_text, assistant_thi
     lambda x: x[0] + x[1] + x[2]
 )
 
-user_blocks = st.one_of(
-    st.builds(TextBlock, text=block_str),
-    st.builds(ImageBlock, source=st.just("url"), url=st.text(min_size=1, max_size=60),
-              detail=st.just(None)),
-)
-
-# User messages: exactly one TextBlock (optional) + multiple ImageBlocks
-# Since canonicalize merges adjacent TextBlocks, we only generate one
+# User messages: one optional TextBlock + ImageBlocks, at least one block total
+# (canonicalize merges adjacent TextBlocks, so generators produce at most one)
 user_text = st.one_of(
     st.just(()),
     st.builds(TextBlock, text=block_str).map(lambda b: (b,)),
@@ -222,12 +235,8 @@ def _conv_strategy():
         blocks=st.tuples(st.builds(ToolResultBlock, tool_use_id=tool_ids,
                                    content=st.tuples(st.builds(TextBlock, text=block_str)))),
     )
-    # Generate valid conversation sequences: alternate user/assistant, with optional tool messages
-    def build_valid_sequence():
-        # Use a composite strategy to build valid sequences
-        pass
-    
-    # Simpler approach: use a list but filter to valid sequences
+    # Wire formats cannot merge adjacent same-role messages, so generated
+    # sequences never repeat a role consecutively.
     msgs = st.lists(
         st.one_of(
             user_msg,
@@ -236,9 +245,9 @@ def _conv_strategy():
         ),
         min_size=0, max_size=8,
     ).filter(lambda msgs: all(
-        msgs[i].role != msgs[i+1].role for i in range(len(msgs)-1)
-    ) if msgs else True)
-    
+        msgs[i].role != msgs[i + 1].role for i in range(len(msgs) - 1)
+    ))
+
     # Build Conversation, then apply canonicalize_conversation so generated
     # conversations are in canonical form (matching wire format round-trip output)
     base = st.builds(Conversation, system=st.one_of(st.none(), st.text(min_size=1, max_size=40)),
@@ -258,6 +267,31 @@ def test_openai_roundtrip(conv):
 def test_anthropic_roundtrip(conv):
     back = adapters.to_ir(adapters.from_ir(conv, "anthropic"), "anthropic")
     assert back == conv, f"Anthropic round-trip lost information:\n{conv}\n-->\n{back}"
+
+
+def _loose_msg_strategy():
+    """Any block mix in any order — feeds the idempotency property, which must
+    hold even for conversations the wire formats could not round-trip."""
+    any_blocks = st.lists(
+        st.one_of(
+            st.builds(TextBlock, text=st.text(max_size=40)),
+            st.builds(ThinkingBlock, text=st.text(max_size=40)),
+            st.builds(ToolUseBlock, id=tool_ids, name=tool_names, arguments=args_dicts),
+            st.builds(ToolResultBlock, tool_use_id=tool_ids,
+                      content=st.tuples(st.builds(TextBlock, text=block_str))),
+        ),
+        min_size=0, max_size=5,
+    ).map(tuple)
+    roles = st.sampled_from(["user", "assistant"])
+    return st.builds(Message, role=roles, blocks=any_blocks)
+
+
+@settings(max_examples=100, suppress_health_check=[HealthCheck.too_slow])
+@given(st.lists(_loose_msg_strategy(), min_size=0, max_size=6).map(tuple))
+def test_canonicalize_idempotent_property(messages):
+    conv = canonicalize_conversation(Conversation(system=None, messages=messages, metadata={}))
+    assert canonicalize_conversation(conv) == conv, \
+        f"canonicalize is not a fixpoint:\n{conv}\n-->\n{canonicalize_conversation(conv)}"
 
 
 def main():

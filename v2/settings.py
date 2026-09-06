@@ -3,19 +3,24 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_prefix="DEEPSEEK_", env_file=".env", env_file_encoding="utf-8", frozen=True
+        env_prefix="DEEPSEEKER_", env_file=".env", env_file_encoding="utf-8",
+        extra="ignore", frozen=True,
     )
 
     API_KEY: str = "dseeker"
     ADMIN_USER: str = "admin"
     ADMIN_PASSWORD: str = "admin"
-    HOST: str = "127.0.0.1"
-    PORT: int = 4000
+    # v1's .env ships bare HOST/PORT; accept both spellings.
+    HOST: str = Field(default="127.0.0.1",
+                      validation_alias=AliasChoices("HOST", "DEEPSEEKER_HOST"))
+    PORT: int = Field(default=4000,
+                      validation_alias=AliasChoices("PORT", "DEEPSEEKER_PORT"))
     DB_PATH: str = "deeperseeker.db"
     ENCRYPTION_KEY: str | None = None
 

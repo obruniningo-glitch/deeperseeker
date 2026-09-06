@@ -134,19 +134,24 @@ def _block_sort_key(block: "ContentBlock") -> int:
 
 def _merge_text(blocks: tuple, sort: bool = True) -> tuple:
     """Merge adjacent TextBlocks, drop empty ones, optionally sort to canonical order.
-    
-    Wire formats cannot represent two adjacent text parts distinctly from one
-    merged part, so the canonical IR never contains adjacent TextBlocks.
-    
+
+    Sort runs BEFORE merging: sorting can make previously separated same-type
+    blocks adjacent (e.g. two ThinkingBlocks split by a ToolUseBlock), and the
+    merged result must be a fixpoint or canonicalize_conversation would not be
+    idempotent.
+
     For ThinkingBlocks: merge adjacent non-redacted ones, keep redacted separate.
-    
+
     Args:
         blocks: Tuple of ContentBlocks to merge
         sort: If True (default), sort blocks to canonical order using _block_sort_key.
               If False, preserve input order (used for ToolResultBlock.content).
     """
+    work = list(blocks)
+    if sort:
+        work.sort(key=_block_sort_key)
     merged: list = []
-    for b in blocks:
+    for b in work:
         if isinstance(b, TextBlock):
             if not b.text:
                 continue
@@ -163,9 +168,6 @@ def _merge_text(blocks: tuple, sort: bool = True) -> tuple:
             # to preserve wire format content order
             b = b.model_copy(update={"content": _merge_text(b.content, sort=False)})
         merged.append(b)
-    
-    if sort:
-        merged.sort(key=_block_sort_key)
     return tuple(merged)
 
 
