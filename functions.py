@@ -907,7 +907,10 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
     }
 
     think_open = False
-    async with session.post(url, cookies=cookie, headers=headers, json=json_data) as r:
+    # total=300: this POST streams the completion response, so it needs a long
+    # ceiling; the session default has no total limit at all.
+    async with session.post(url, cookies=cookie, headers=headers, json=json_data,
+                            timeout=aiohttp.ClientTimeout(total=300)) as r:
         if r.status != 200:
             error_text = await r.text()
             raise Exception(f"HTTP {r.status}: {error_text}")
@@ -1045,7 +1048,7 @@ async def get_file_content(auth_token, file_id):
     if not js_data.get("signed_path"):
         return
     file_path = "https://files.deepseeksvc.com/api" + js_data["signed_path"] + "&ty=r"
-    async with session.get(file_path) as data:
+    async with session.get(file_path, timeout=aiohttp.ClientTimeout(total=120)) as data:
         async for chunk in data.content.iter_chunked(8192):
             if chunk:
                 yield chunk

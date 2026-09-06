@@ -369,6 +369,15 @@ def test_sig_lock_removed_after_handle_chat():
     asyncio.run(run())
 
 
+def test_outbound_calls_have_explicit_timeouts():
+    import inspect
+    import functions
+    src = inspect.getsource(functions.send_message)
+    assert "ClientTimeout(total=300)" in src, "send_message completion POST must have a total=300 timeout"
+    src = inspect.getsource(functions.get_file_content)
+    assert "ClientTimeout(total=120)" in src, "get_file_content signed-URL download must have a total=120 timeout"
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0
