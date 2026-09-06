@@ -119,13 +119,28 @@ def check_key(request: Request):
     return secrets.compare_digest(key.encode("utf-8"), API_KEY.encode("utf-8"))
 
 
+def session_hit_ok(sess, hist_len):
+    """One-sided length guard for tolerant-signature cache hits.
+
+    The signature truncates history at the last assistant message, so the true
+    continuation of a session always has exactly the stored non-system message
+    count (compaction only shrinks the middle). A request with a LONGER
+    truncated history than the stored row cannot be a legitimate continuation
+    — treat it as a miss. Legacy rows (hist_len is None) bypass the guard.
+    """
+    stored = sess.get("hist_len")
+    return stored is None or hist_len <= stored
+
+
 async def handle_chat(messages, model, thinking=False, search=False, stream=False, tools=None, is_anthropic=False, req_model=None, scope="", _retried=False):
     auth_token = get_auth_token()
     if not auth_token:
         return JSONResponse({"error": "No auth token. Add via dashboard."}, status_code=401)
 
-    sig = await generate_signature(messages, model, scope)
+    sig, hist_len = await generate_signature(messages, model, scope)
     sess = find_session(sig)
+    if sess and not session_hit_ok(sess, hist_len):
+        sess = None
 
     if sess:
 
@@ -145,8 +160,8 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                     gen = send_message(new_session_id, new_tok["token"], prompt, 0, thinking, search, None if model == "instant" else model, file_ids)
                     if stream:
                         if is_anthropic:
-                            return StreamingResponse(stream_anthropic_response(gen, model, messages, new_token_id, new_session_id, sig, tools, req_model, 0, scope), media_type="text/event-stream")
-                        return StreamingResponse(stream_response(gen, model, messages, new_token_id, new_session_id, sig, tools, 0, scope), media_type="text/event-stream")
+                            return StreamingResponse(stream_anthropic_response(gen, model, messages, new_token_id, new_session_id, sig, tools, req_model, 0, scope, hist_len=hist_len), media_type="text/event-stream")
+                        return StreamingResponse(stream_response(gen, model, messages, new_token_id, new_session_id, sig, tools, 0, scope, hist_len=hist_len), media_type="text/event-stream")
                     else:
                         resp_text = await collect_response(gen)
                         mark_active(new_token_id)
@@ -161,10 +176,10 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                         else:
                             ast_msg["content"] = clean_text
                         next_messages.append(ast_msg)
-                        next_sig = await generate_signature(next_messages, model, scope)
+                        next_sig, next_len = await generate_signature(next_messages, model, scope)
 
-                        save_session(sig, new_token_id, new_session_id, next_parent(0))
-                        save_session(next_sig, new_token_id, new_session_id, next_parent(0))
+                        save_session(sig, new_token_id, new_session_id, next_parent(0), hist_len=hist_len)
+                        save_session(next_sig, new_token_id, new_session_id, next_parent(0), hist_len=next_len)
                         return format_response(resp_text, model, messages, tools)
     else:
 
@@ -172,6 +187,8 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
         try:
             async with create_lock:
                 sess = find_session(sig)
+                if sess and not session_hit_ok(sess, hist_len):
+                    sess = None
                 if not sess:
                     token_id = pick_token()
                     if not token_id:
@@ -180,7 +197,7 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                     if not tok:
                         return JSONResponse({"error": "Token not found"}, status_code=503)
                     session_id = await create_new_chat(tok["token"])
-                    save_session(sig, token_id, session_id, 0)
+                    save_session(sig, token_id, session_id, 0, hist_len=hist_len)
                     parent_message_id = 0
                 else:
                     token_id = sess["token_id"]
@@ -204,8 +221,8 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
         gen = send_message(session_id, tok["token"], prompt, parent_message_id, thinking, search, None if model == "instant" else model, file_ids)
         if stream:
             if is_anthropic:
-                return StreamingResponse(stream_anthropic_response(gen, model, messages, token_id, session_id, sig, tools, req_model, parent_message_id, scope), media_type="text/event-stream")
-            return StreamingResponse(stream_response(gen, model, messages, token_id, session_id, sig, tools, parent_message_id, scope), media_type="text/event-stream")
+                return StreamingResponse(stream_anthropic_response(gen, model, messages, token_id, session_id, sig, tools, req_model, parent_message_id, scope, hist_len=hist_len), media_type="text/event-stream")
+            return StreamingResponse(stream_response(gen, model, messages, token_id, session_id, sig, tools, parent_message_id, scope, hist_len=hist_len), media_type="text/event-stream")
         else:
             resp_text = await collect_response(gen)
             mark_active(token_id)
@@ -220,10 +237,10 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
             else:
                 ast_msg["content"] = clean_text
             next_messages.append(ast_msg)
-            next_sig = await generate_signature(next_messages, model, scope)
+            next_sig, next_len = await generate_signature(next_messages, model, scope)
 
-            save_session(sig, token_id, session_id, next_parent(parent_message_id))
-            save_session(next_sig, token_id, session_id, next_parent(parent_message_id))
+            save_session(sig, token_id, session_id, next_parent(parent_message_id), hist_len=hist_len)
+            save_session(next_sig, token_id, session_id, next_parent(parent_message_id), hist_len=next_len)
             return format_response(resp_text, model, messages, tools)
     except Exception as e:
         delete_session(sig)
@@ -273,7 +290,7 @@ async def _hold_think_tags(gen):
         yield carry
 
 
-async def stream_response(gen, model, messages, token_id, session_id, sig, tools, parent_message_id=0, scope=""):
+async def stream_response(gen, model, messages, token_id, session_id, sig, tools, parent_message_id=0, scope="", hist_len=None):
     parser = StreamToolParser()
     full_text = ""
     is_thinking = False
@@ -338,9 +355,9 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
             else:
                 ast_msg["content"] = clean_text
             next_messages.append(ast_msg)
-            next_sig = generate_signature_sync(next_messages, model, scope)
-            save_session(sig, token_id, session_id, next_parent(parent_message_id))
-            save_session(next_sig, token_id, session_id, next_parent(parent_message_id))
+            next_sig, next_len = generate_signature_sync(next_messages, model, scope)
+            save_session(sig, token_id, session_id, next_parent(parent_message_id), hist_len=hist_len)
+            save_session(next_sig, token_id, session_id, next_parent(parent_message_id), hist_len=next_len)
 
         if not aborted and not failed:
             try:
@@ -362,7 +379,7 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
                 pass
 
 
-async def stream_anthropic_response(gen, model, messages, token_id, session_id, sig, tools, req_model=None, parent_message_id=0, scope=""):
+async def stream_anthropic_response(gen, model, messages, token_id, session_id, sig, tools, req_model=None, parent_message_id=0, scope="", hist_len=None):
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
     in_tokens = count_tok(_messages_text(messages))
     model_name = req_model if req_model else model
@@ -451,9 +468,9 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
             else:
                 ast_msg["content"] = clean_text
             next_messages.append(ast_msg)
-            next_sig = generate_signature_sync(next_messages, model, scope)
-            save_session(sig, token_id, session_id, next_parent(parent_message_id))
-            save_session(next_sig, token_id, session_id, next_parent(parent_message_id))
+            next_sig, next_len = generate_signature_sync(next_messages, model, scope)
+            save_session(sig, token_id, session_id, next_parent(parent_message_id), hist_len=hist_len)
+            save_session(next_sig, token_id, session_id, next_parent(parent_message_id), hist_len=next_len)
 
         def _tb(text):
             return (f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index_local[0], 'content_block': {'type': 'text', 'text': ''}})}\n\n"

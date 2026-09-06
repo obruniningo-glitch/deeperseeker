@@ -9,9 +9,16 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app import API_KEY, convert_anthropic_messages
-from functions import parse_tools
-from plugin_helper import build_prompt, generate_signature_sync
+from app import API_KEY, convert_anthropic_messages, session_hit_ok
+from functions import count_tokens, parse_tools
+from plugin_helper import (
+    DEFAULT_PROMPT_BUDGET,
+    build_prompt,
+    clip_text,
+    compact_history,
+    generate_signature_sync,
+    project_signature,
+)
 
 
 def test_api_key_never_empty():
@@ -416,6 +423,158 @@ def test_uvicorn_defaults_to_loopback():
     import app
     src = inspect.getsource(app)
     assert 'os.getenv("HOST", "127.0.0.1")' in src, "uvicorn must default to 127.0.0.1, not 0.0.0.0"
+
+
+def _long_conv():
+    msgs = [
+        {"role": "system", "content": "You are a coding agent."},
+        {"role": "user", "content": "Fix the bug in app.py"},
+    ]
+    for i in range(10):
+        msgs.append({"role": "assistant", "content": f"step {i} done"})
+        msgs.append({"role": "user", "content": f"continue {i}"})
+    return msgs
+
+
+def test_clip_text_deterministic_head_tail():
+    text = " ".join(f"token{i}" for i in range(2000))
+    a = clip_text(text, 100, label="result from Bash")
+    b = clip_text(text, 100, label="result from Bash")
+    assert a == b, "clip_text must be deterministic"
+    assert count_tokens(a) <= 100 + 20, "clipped text must respect the cap (plus marker overhead)"
+    assert "token0" in a, "head must be preserved"
+    assert "token1999" in a, "tail must be preserved"
+    assert "elided" in a, "elision marker must be present"
+
+
+def test_clip_text_noop_under_cap():
+    text = "short output"
+    assert clip_text(text, 100) == text
+
+
+def test_compact_history_tiers_and_elides_old_tools():
+    fat = "x" * 8000
+    msgs = [{"role": "system", "content": "sys"}]
+    for i in range(6):
+        msgs.append({"role": "assistant", "content": f"call {i}"})
+        msgs.append({"role": "tool", "name": "Bash", "tool_call_id": f"c{i}", "content": fat})
+    msgs.append({"role": "user", "content": "RECENT QUESTION verbatim"})
+    hist = compact_history(msgs, budget_tokens=100000, recent_turns=2)
+    assert "RECENT QUESTION verbatim" in hist, "recent window stays verbatim"
+    assert "tool Bash: [~" in hist, "old tool results become stubs naming the tool"
+    fat_lines = [l for l in hist.split("\n") if "x" * 100 in l]
+    assert len(fat_lines) == 1, "only the recent window's clipped result may carry fat content"
+
+
+def test_build_prompt_first_message_under_budget():
+    fat = "y" * 4000
+    msgs = [{"role": "system", "content": "You are an agent."}]
+    for i in range(100):
+        msgs.append({"role": "user", "content": f"step {i}"})
+        msgs.append({"role": "assistant", "content": f"working on {i}"})
+        msgs.append({"role": "tool", "name": "Read", "tool_call_id": f"c{i}", "content": fat})
+    msgs.append({"role": "user", "content": "final question"})
+    prompt = asyncio.run(build_prompt(msgs, [], "expert", is_first_message=True))
+    assert count_tokens(prompt) <= DEFAULT_PROMPT_BUDGET, "prompt must fit the default budget"
+
+
+def test_tolerant_signature_survives_middle_rewrite():
+    msgs1 = _long_conv()
+    msgs2 = [dict(m) for m in msgs1]
+    msgs2[4]["content"] = "REWRITTEN BY COMPACTION"
+    assert generate_signature_sync(msgs1, "expert") == generate_signature_sync(msgs2, "expert"), \
+        "middle-of-history rewrite must not change the signature"
+
+
+def test_tolerant_signature_distinguishes_different_bodies():
+    msgs1 = _long_conv()
+    msgs2 = [dict(m) for m in msgs1]
+    # the final user message is post-assistant (excluded from the key), so
+    # mutate the last assistant message, which IS inside the tail window
+    msgs2[-2]["content"] = "a genuinely different final assistant message"
+    assert generate_signature_sync(msgs1, "expert") != generate_signature_sync(msgs2, "expert"), \
+        "different tails must produce different signatures"
+
+
+def test_truncation_at_last_assistant_still_applies():
+    msgs = _long_conv()
+    extended = msgs + [
+        {"role": "user", "content": "new question"},
+        {"role": "tool", "name": "Bash", "tool_call_id": "c1", "content": "result"},
+    ]
+    assert generate_signature_sync(msgs, "expert") == generate_signature_sync(extended, "expert"), \
+        "post-assistant messages must stay out of the key"
+
+
+def test_next_sig_survives_client_side_compaction():
+    model_output = '<tool_call>{"name": "Bash", "arguments": {"command": "ls"}}</tool_call>'
+    parsed_tools, _ = parse_tools(model_output)
+    conv1 = _long_conv()
+    server_msgs = conv1 + [{"role": "assistant", "tool_calls": parsed_tools}]
+    next_sig = generate_signature_sync(server_msgs, "expert")
+
+    conv2 = [dict(m) for m in conv1]
+    conv2[4]["content"] = "REWRITTEN BY COMPACTION"
+    client_msgs = conv2 + [
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "ls"}},
+        ]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_1", "content": "file.txt"},
+        ]},
+        {"role": "user", "content": "and now?"},
+    ]
+    converted = convert_anthropic_messages(client_msgs)
+    assert generate_signature_sync(converted, "expert") == next_sig, \
+        "post-compaction client request must hit the next_sig row"
+
+
+def test_k_zero_disables_tolerance():
+    import unittest.mock as mock
+    msgs1 = _long_conv()
+    msgs2 = [dict(m) for m in msgs1]
+    msgs2[4]["content"] = "REWRITTEN BY COMPACTION"
+    with mock.patch.dict(os.environ, {"DEEPSEEKER_SIG_WINDOW_K": "0"}):
+        assert generate_signature_sync(msgs1, "expert") != generate_signature_sync(msgs2, "expert"), \
+            "K=0 must restore full-history sensitivity"
+
+
+def test_k_change_invalidates_cache():
+    import unittest.mock as mock
+    msgs = _long_conv()
+    with mock.patch.dict(os.environ, {"DEEPSEEKER_SIG_WINDOW_K": "8"}):
+        s8 = generate_signature_sync(msgs, "expert")
+    with mock.patch.dict(os.environ, {"DEEPSEEKER_SIG_WINDOW_K": "12"}):
+        s12 = generate_signature_sync(msgs, "expert")
+    assert s8 != s12, "changing K must invalidate all cached keys"
+
+
+def test_hist_len_guard_and_storage():
+    db, old_db, cm = _temp_db({})
+    try:
+        import functions
+        functions.init_db()
+        functions.save_session("sigA", 1, "ds1", 0, hist_len=3)
+        sess = functions.find_session("sigA")
+        assert sess["hist_len"] == 3
+        # one-sided guard: shorter-or-equal continues, longer is a foreign hit
+        assert session_hit_ok(sess, 3) and session_hit_ok(sess, 2)
+        assert not session_hit_ok(sess, 5)
+        legacy = {"hist_len": None}
+        assert session_hit_ok(legacy, 999), "legacy rows bypass the guard"
+    finally:
+        _restore_db(old_db, cm)
+
+
+def test_save_without_hist_len_stores_null():
+    db, old_db, cm = _temp_db({})
+    try:
+        import functions
+        functions.init_db()
+        functions.save_session("sigB", 1, "ds2", 0)
+        assert functions.find_session("sigB")["hist_len"] is None
+    finally:
+        _restore_db(old_db, cm)
 
 
 def main():
