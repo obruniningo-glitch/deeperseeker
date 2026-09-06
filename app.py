@@ -400,14 +400,17 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
                 continue
             full_text += chunk
 
-            if "<think>" in chunk:
+            # Only treat <think> as a real thinking opener at the head of the
+            # message (DeepSeek always thinks before content). A literal
+            # <think> echoed inside content must stay content.
+            if "<think>" in chunk and not text_block_started and not is_thinking:
                 is_thinking = True
                 chunk = chunk.replace("<think>", "").lstrip("\n")
                 start_block = f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'thinking'}})}\n\n"
                 yield start_block
 
             end_thinking = False
-            if "</think>" in chunk:
+            if "</think>" in chunk and is_thinking:
                 is_thinking = False
                 end_thinking = True
                 parts = chunk.split("</think>")
@@ -479,9 +482,16 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
 
         block_index_local = [block_index]
         tail_events = ""
+        # Close any open blocks BEFORE emitting tool_use blocks: the Anthropic
+        # SSE protocol forbids two open content_blocks (especially at the same
+        # index), and clients drop the whole message on a malformed sequence.
         if is_thinking:
             tail_events += f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index_local[0]})}\n\n"
             block_index_local[0] += 1
+        if text_block_started:
+            tail_events += f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index_local[0]})}\n\n"
+            block_index_local[0] += 1
+            text_block_started = False
 
         flushed_text = ""
         if not parsed_tools:
@@ -491,8 +501,6 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
 
         if not text_block_started and not parsed_tools and (clean_text or flushed_text):
             tail_events += _tb(clean_text or flushed_text)
-        elif text_block_started and not parsed_tools:
-            tail_events += f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index_local[0]})}\n\n"
 
         if parsed_tools:
             for tc in parsed_tools:

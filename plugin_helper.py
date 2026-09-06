@@ -564,7 +564,7 @@ def project_signature(messages, model, scope=""):
 
 
 def generate_signature_sync(messages, model, scope=""):
-    return project_signature(messages, model, scope)[0]
+    return project_signature(messages, model, scope)
 
 
 async def generate_signature(messages, model, scope=""):

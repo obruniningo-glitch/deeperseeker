@@ -577,6 +577,78 @@ def test_save_without_hist_len_stores_null():
         _restore_db(old_db, cm)
 
 
+def _run_anthropic_stream(chunks):
+    """Drive stream_anthropic_response with a fake DeepSeek generator."""
+    import asyncio
+    import functions
+    from app import stream_anthropic_response
+
+    async def fake_gen():
+        for c in chunks:
+            yield c
+
+    async def run():
+        out = []
+        async for evt in stream_anthropic_response(
+                fake_gen(), "expert", [{"role": "user", "content": "hi"}],
+                1, "sess", "sig", None, parent_message_id=0):
+            out.append(evt)
+        return out
+
+    db, old_db, cm = _temp_db({})
+    try:
+        functions.init_db()
+        return asyncio.run(run())
+    finally:
+        _restore_db(old_db, cm)
+
+
+def _validate_block_lifecycle(events):
+    """Assert every content_block_start/stop pairs correctly, never twice-open."""
+    import json as _json
+    open_blocks = set()
+    for evt in events:
+        for line in evt.split("\n"):
+            if line.startswith("data: ") and "content_block_" in line:
+                d = _json.loads(line[6:])
+                t, idx = d["type"], d.get("index")
+                if t == "content_block_start":
+                    assert idx not in open_blocks, f"content_block_start on already-open index {idx}"
+                    open_blocks.add(idx)
+                elif t == "content_block_stop":
+                    assert idx in open_blocks, f"content_block_stop on never-opened index {idx}"
+                    open_blocks.discard(idx)
+    assert not open_blocks, f"blocks left open at end of stream: {open_blocks}"
+
+
+def test_anthropic_stream_text_then_tool_call_valid_blocks():
+    chunks = [
+        "Here is a long explanation with tables and more, several pages of it.\n\n",
+        "More prose follows here.\n\n",
+        '```json\n{"name": "get_weather", "arguments": {"city": "Berlin"}}\n```',
+    ]
+    events = _run_anthropic_stream(chunks)
+    _validate_block_lifecycle(events)
+    joined = "\n".join(events)
+    assert "tool_use" in joined and "get_weather" in joined
+    assert "message_stop" in joined
+
+
+def test_anthropic_stream_literal_think_tags_stay_content():
+    chunks = ["Some text first. ", "<think> example </think> and after."]
+    events = _run_anthropic_stream(chunks)
+    _validate_block_lifecycle(events)
+    joined = "\n".join(events)
+    assert '"thinking"' not in joined, "literal think tags in content must not open a thinking block"
+    assert "&lt;" in joined or "<think>" in joined
+
+
+def test_anthropic_stream_unclosed_think_block_closes_cleanly():
+    chunks = ["<think>reasoning that never closes"]
+    events = _run_anthropic_stream(chunks)
+    _validate_block_lifecycle(events)
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0
