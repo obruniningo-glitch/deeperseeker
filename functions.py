@@ -342,12 +342,40 @@ def delete_token(token_id):
 def pick_token():
     conn = get_db()
     row = conn.execute("SELECT id FROM tokens WHERE status = 'ACTIVE' ORDER BY RANDOM() LIMIT 1").fetchone()
-    if row:
-        conn.close()
-        return row[0]
-    row = conn.execute("SELECT id FROM tokens ORDER BY id LIMIT 1").fetchone()
     conn.close()
-    return row[0] if row else None
+    if row:
+        return row[0]
+    # No ACTIVE token: fail fast (503 at the call sites) instead of serving a
+    # rate-limited token, which is guaranteed to burn a PoW solve and a web
+    # round-trip on a doomed request.
+    return None
+
+
+def health_snapshot():
+    """Machine-readable pool/DB/cookie status for the /health endpoint."""
+    conn = get_db()
+    try:
+        statuses = dict(conn.execute("SELECT status, COUNT(*) FROM tokens GROUP BY status").fetchall())
+        sessions = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+    finally:
+        conn.close()
+    cookie_expiry = None
+    try:
+        if os.path.exists("aws_cookies_deepseek.json"):
+            with open("aws_cookies_deepseek.json") as f:
+                cookie_expiry = json.load(f).get("expiry")
+    except Exception:
+        pass
+    return {
+        "tokens": {
+            "active": statuses.get("ACTIVE", 0),
+            "rate_limited": statuses.get("RATE_LIMITED", 0),
+            "total": sum(statuses.values()),
+        },
+        "cached_sessions": sessions,
+        "cookie_expiry": cookie_expiry,
+        "cookie_valid": bool(cookie_expiry and cookie_expiry > time.time()),
+    }
 
 
 def mark_limited(token_id):

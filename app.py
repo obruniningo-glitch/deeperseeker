@@ -45,6 +45,7 @@ from functions import (
     next_parent,
     parse_tools,
     pick_token,
+    health_snapshot,
     save_session,
     delete_session,
     send_message,
@@ -962,6 +963,14 @@ async def anthropic_messages(request: Request):
     if not isinstance(result, dict) or "choices" not in result:
         return result
     return format_anthropic_response(result, req_model)
+
+
+@app.get("/health")
+async def health(request: Request):
+    """Machine-readable pool/DB/cookie status (API-key protected)."""
+    if not check_key(request):
+        return JSONResponse({"error": "Invalid API key"}, status_code=401)
+    return JSONResponse(health_snapshot())
 
 
 @app.get("/v1/models")

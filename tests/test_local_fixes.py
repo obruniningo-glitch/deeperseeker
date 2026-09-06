@@ -649,6 +649,38 @@ def test_anthropic_stream_unclosed_think_block_closes_cleanly():
     _validate_block_lifecycle(events)
 
 
+def test_pick_token_never_serves_rate_limited_tokens():
+    db, old_db, cm = _temp_db({})
+    try:
+        import functions
+        functions.init_db()
+        functions.add_token("tok1", "a")
+        functions.add_token("tok2", "b")
+        functions.mark_limited(1)
+        functions.mark_limited(2)
+        assert functions.pick_token() is None, "no ACTIVE token must fail fast, not serve a rate-limited one"
+        functions.mark_active(2)
+        assert functions.pick_token() == 2
+    finally:
+        _restore_db(old_db, cm)
+
+
+def test_health_snapshot_and_route_exist():
+    db, old_db, cm = _temp_db({})
+    try:
+        import functions
+        functions.init_db()
+        functions.add_token("tok1", "a")
+        snap = functions.health_snapshot()
+        assert snap["tokens"]["total"] == 1 and snap["tokens"]["active"] == 1
+        assert snap["cached_sessions"] == 0
+        assert isinstance(snap["cookie_valid"], bool)
+        import app as app_module
+        assert any(getattr(r, "path", None) == "/health" for r in app_module.app.routes), "/health route must exist"
+    finally:
+        _restore_db(old_db, cm)
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0
