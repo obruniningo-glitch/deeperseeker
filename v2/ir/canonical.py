@@ -65,10 +65,13 @@ def _merge_text(blocks: tuple[ContentBlock, ...], sort: bool = True) -> tuple[Co
                 merged[-1] = TextBlock(text=merged[-1].text + "\n" + b.text)
                 continue
         elif isinstance(b, ThinkingBlock):
-            if not b.is_redacted and b.text:
+            if not b.is_redacted:
+                if not b.text:
+                    continue  # skip empty non-redacted ThinkingBlocks
                 if merged and isinstance(merged[-1], ThinkingBlock) and not merged[-1].is_redacted:
                     merged[-1] = ThinkingBlock(text=merged[-1].text + "\n" + b.text)
                     continue
+            # redacted ThinkingBlocks are always kept
         elif isinstance(b, ToolResultBlock):
             # Recursively process ToolResultBlock content WITHOUT sorting
             # to preserve wire format content order

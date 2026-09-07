@@ -84,6 +84,10 @@ def get_registry() -> ProviderRegistry:
         # Register built-in fake provider
         _REGISTRY.register(FakeProvider())
         _REGISTRY.register_model("fake", "fake", "fake")
+        # Register DeepSeek model aliases
+        _REGISTRY.register_model("instant", "deepseek", "deepseek-v4-flash")
+        _REGISTRY.register_model("expert", "deepseek", "deepseek-v4-pro")
+        _REGISTRY.register_model("vision", "deepseek", "deepseek-v4-pro")
         _REGISTRY.default_provider = "fake"
     return _REGISTRY
 
