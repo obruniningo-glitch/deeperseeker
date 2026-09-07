@@ -59,6 +59,48 @@ from plugin_helper import build_prompt, extract_and_upload_files, generate_signa
 logger = logging.getLogger("uvicorn.error")
 
 
+_PLACEHOLDER_ARG_VALUES = {"<value>", "<value/>", "{{value}}", "value"}
+
+
+def _valid_tool_names(tools):
+    names = set()
+    for t in tools or []:
+        if t.get("type") == "function" and isinstance(t.get("function"), dict):
+            names.add(t["function"].get("name", ""))
+        elif t.get("name"):
+            names.add(t["name"])
+    return {n for n in names if n}
+
+
+def _filter_placeholder_tool_calls(parsed_tools, tools):
+    """Drop calls the model copied from the injected format example.
+
+    With thinking enabled, deepseek-v4-pro sometimes emits the real call AND a
+    literal copy of the <value> placeholder example (or a call to a tool that
+    was never offered). Executing those on the client produces bogus tool
+    errors, so drop them before they reach the wire.
+    """
+    if not parsed_tools:
+        return parsed_tools
+    valid = _valid_tool_names(tools)
+    kept = []
+    for tc in parsed_tools:
+        fn = tc.get("function", {})
+        name = fn.get("name", "")
+        if valid and name not in valid:
+            continue
+        raw_args = fn.get("arguments")
+        try:
+            args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+        except Exception:
+            args = None
+        if isinstance(args, dict):
+            if any(isinstance(v, str) and v.strip() in _PLACEHOLDER_ARG_VALUES for v in args.values()):
+                continue
+        kept.append(tc)
+    return kept
+
+
 def count_tok(text):
     return len(deepseek_tokenizer.ds_token.encode(text))
 
@@ -133,6 +175,56 @@ def session_hit_ok(sess, hist_len):
     return stored is None or hist_len <= stored
 
 
+class _RetryingStream:
+    """send_message wrapper that retries on empty upstream turns.
+
+    DeepSeek's web endpoint intermittently FINISHes a request with zero
+    fragments (observed on roughly 2 of 3 requests for tool-heavy prompts,
+    nondeterministically). An empty turn must never reach the client and must
+    never advance parent_message_id, so on empty we discard the chat session
+    and resend the same prompt on a fresh one. The session actually used is
+    exposed via used_session_id / used_parent so the callers' bookkeeping
+    stays correct across retries.
+    """
+
+    def __init__(self, auth_token, session_id, parent_message_id, prompt,
+                 thinking, search, model_type, file_ids, max_attempts=3):
+        self.auth_token = auth_token
+        self.session_id = session_id
+        self.parent_message_id = parent_message_id
+        self.prompt = prompt
+        self.thinking = thinking
+        self.search = search
+        self.model_type = model_type
+        self.file_ids = file_ids
+        self.max_attempts = max_attempts
+        self.used_session_id = session_id
+        self.used_parent = parent_message_id
+
+    def __aiter__(self):
+        return self._run()
+
+    async def _run(self):
+        for attempt in range(1, self.max_attempts + 1):
+            produced = False
+            gen = send_message(self.session_id, self.auth_token, self.prompt,
+                               self.parent_message_id, self.thinking, self.search,
+                               self.model_type, self.file_ids)
+            async for chunk in gen:
+                if chunk and chunk.strip():
+                    produced = True
+                yield chunk
+            if produced:
+                return
+            if attempt < self.max_attempts:
+                self.session_id = await create_new_chat(self.auth_token)
+                self.parent_message_id = 0
+                self.used_session_id = self.session_id
+                self.used_parent = 0
+                logger.info("empty upstream turn (attempt %d/%d); retrying on fresh chat %s",
+                            attempt, self.max_attempts, self.session_id)
+
+
 async def handle_chat(messages, model, thinking=False, search=False, stream=False, tools=None, is_anthropic=False, req_model=None, scope="", _retried=False):
     auth_token = get_auth_token()
     if not auth_token:
@@ -158,7 +250,7 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                     prompt = await build_prompt(messages, tools or [], model, is_first_message=True)
 
                     file_ids = await extract_and_upload_files(messages, new_tok["token"])
-                    gen = send_message(new_session_id, new_tok["token"], prompt, 0, thinking, search, None if model == "instant" else model, file_ids)
+                    gen = _RetryingStream(new_tok["token"], new_session_id, 0, prompt, thinking, search, None if model == "instant" else model, file_ids)
                     if stream:
                         if is_anthropic:
                             return StreamingResponse(stream_anthropic_response(gen, model, messages, new_token_id, new_session_id, sig, tools, req_model, 0, scope, hist_len=hist_len), media_type="text/event-stream")
@@ -168,6 +260,7 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                         mark_active(new_token_id)
 
                         parsed_tools, clean_text = parse_tools(resp_text)
+                        parsed_tools = _filter_placeholder_tool_calls(parsed_tools, tools)
                         clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
                         clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
                         next_messages = messages.copy()
@@ -179,8 +272,15 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
                         next_messages.append(ast_msg)
                         next_sig, next_len = await generate_signature(next_messages, model, scope)
 
-                        save_session(sig, new_token_id, new_session_id, next_parent(0), hist_len=hist_len)
-                        save_session(next_sig, new_token_id, new_session_id, next_parent(0), hist_len=next_len)
+                        if parsed_tools or clean_text:
+                            save_session(sig, new_token_id, gen.used_session_id, next_parent(gen.used_parent), hist_len=hist_len)
+                            save_session(next_sig, new_token_id, gen.used_session_id, next_parent(gen.used_parent), hist_len=next_len)
+                        else:
+                            # Empty model turn (all retry attempts empty): the
+                            # server created only the user message, so
+                            # advancing parent by 2 would poison the session
+                            # chain. Drop the binding.
+                            delete_session(sig)
                         return format_response(resp_text, model, messages, tools)
     else:
 
@@ -219,7 +319,7 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
     prompt = await build_prompt(messages, tools or [], model, is_first)
 
     try:
-        gen = send_message(session_id, tok["token"], prompt, parent_message_id, thinking, search, None if model == "instant" else model, file_ids)
+        gen = _RetryingStream(tok["token"], session_id, parent_message_id, prompt, thinking, search, None if model == "instant" else model, file_ids)
         if stream:
             if is_anthropic:
                 return StreamingResponse(stream_anthropic_response(gen, model, messages, token_id, session_id, sig, tools, req_model, parent_message_id, scope, hist_len=hist_len), media_type="text/event-stream")
@@ -229,6 +329,7 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
             mark_active(token_id)
 
             parsed_tools, clean_text = parse_tools(resp_text)
+            parsed_tools = _filter_placeholder_tool_calls(parsed_tools, tools)
             clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
             clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
             next_messages = messages.copy()
@@ -240,8 +341,14 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
             next_messages.append(ast_msg)
             next_sig, next_len = await generate_signature(next_messages, model, scope)
 
-            save_session(sig, token_id, session_id, next_parent(parent_message_id), hist_len=hist_len)
-            save_session(next_sig, token_id, session_id, next_parent(parent_message_id), hist_len=next_len)
+            if parsed_tools or clean_text:
+                save_session(sig, token_id, gen.used_session_id, next_parent(gen.used_parent), hist_len=hist_len)
+                save_session(next_sig, token_id, gen.used_session_id, next_parent(gen.used_parent), hist_len=next_len)
+            else:
+                # Empty model turn (all retry attempts empty): advancing parent
+                # by 2 would point the next request at a nonexistent message
+                # and yield empty FINISHED responses forever. Drop the binding.
+                delete_session(sig)
             return format_response(resp_text, model, messages, tools)
     except Exception as e:
         delete_session(sig)
@@ -345,6 +452,7 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
             pass
     finally:
         parsed_tools, clean_text = parse_tools(full_text)
+        parsed_tools = _filter_placeholder_tool_calls(parsed_tools, tools)
         clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
         clean_text = re.sub(r"</?(?:tool_calls?|invoke|function_call|parameter)[^>]*>", "", clean_text, flags=re.IGNORECASE).strip()
 
@@ -357,8 +465,16 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
                 ast_msg["content"] = clean_text
             next_messages.append(ast_msg)
             next_sig, next_len = generate_signature_sync(next_messages, model, scope)
-            save_session(sig, token_id, session_id, next_parent(parent_message_id), hist_len=hist_len)
-            save_session(next_sig, token_id, session_id, next_parent(parent_message_id), hist_len=next_len)
+
+            if parsed_tools or clean_text or full_text.strip():
+                eff_sid = getattr(gen, "used_session_id", session_id)
+                eff_parent = getattr(gen, "used_parent", parent_message_id)
+                save_session(sig, token_id, eff_sid, next_parent(eff_parent), hist_len=hist_len)
+                save_session(next_sig, token_id, eff_sid, next_parent(eff_parent), hist_len=next_len)
+            else:
+                # Empty model turn: never advance parent_message_id past a
+                # message that was never created server-side.
+                delete_session(sig)
 
         if not aborted and not failed:
             try:
@@ -459,6 +575,7 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
             pass
     finally:
         parsed_tools, clean_text = parse_tools(full_text)
+        parsed_tools = _filter_placeholder_tool_calls(parsed_tools, tools)
         out_tokens = count_tok(full_text)
 
         clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
@@ -473,8 +590,16 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
                 ast_msg["content"] = clean_text
             next_messages.append(ast_msg)
             next_sig, next_len = generate_signature_sync(next_messages, model, scope)
-            save_session(sig, token_id, session_id, next_parent(parent_message_id), hist_len=hist_len)
-            save_session(next_sig, token_id, session_id, next_parent(parent_message_id), hist_len=next_len)
+
+            if parsed_tools or clean_text or full_text.strip():
+                eff_sid = getattr(gen, "used_session_id", session_id)
+                eff_parent = getattr(gen, "used_parent", parent_message_id)
+                save_session(sig, token_id, eff_sid, next_parent(eff_parent), hist_len=hist_len)
+                save_session(next_sig, token_id, eff_sid, next_parent(eff_parent), hist_len=next_len)
+            else:
+                # Empty model turn: never advance parent_message_id past a
+                # message that was never created server-side.
+                delete_session(sig)
 
         def _tb(text):
             return (f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index_local[0], 'content_block': {'type': 'text', 'text': ''}})}\n\n"
@@ -528,6 +653,7 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
 def format_response(text, model, messages, tools=None):
     from functions import DEEPSEEK_TARIFFS
     parsed_tools, clean_text = parse_tools(text)
+    parsed_tools = _filter_placeholder_tool_calls(parsed_tools, tools)
 
     reasoning = None
     match = re.search(r"<think>\s*(.*?)\s*</think>\s*", text, flags=re.DOTALL)

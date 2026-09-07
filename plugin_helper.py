@@ -589,13 +589,48 @@ def _pre_assistant_history(messages):
     return [m for m in messages[:last_ast_idx + 1] if m.get("role") != "system"]
 
 
+def _tool_call_example(tools):
+    """Concrete <tool_call> example built from the caller's first tool.
+
+    The old static example ({"name": "tool_name", "arguments": {"param":
+    "value"}}) was copied verbatim by deepseek-v4-pro, producing a call to a
+    nonexistent "tool_name" tool. Building the example from the real schema
+    (real tool name, real parameter names, "<value>" placeholders) keeps the
+    format instruction while making literal copying obvious and unattractive.
+    """
+    fn = None
+    for t in tools or []:
+        if t.get("type") == "function":
+            fn = t.get("function", {})
+        elif "name" in t:
+            fn = t
+        if fn and fn.get("name"):
+            break
+        fn = None
+    if not fn:
+        return '<tool_call>{"name": "the_tool_name", "arguments": {"argument": "value"}}</tool_call>'
+    params = fn.get("parameters") or fn.get("input_schema") or {}
+    props = params.get("properties", {}) if isinstance(params, dict) else {}
+    args = {}
+    for key, spec in list(props.items())[:3]:
+        ptype = spec.get("type", "string") if isinstance(spec, dict) else "string"
+        if ptype in ("number", "integer"):
+            args[key] = 0
+        elif ptype == "boolean":
+            args[key] = False
+        else:
+            args[key] = "<value>"
+    return '<tool_call>{"name": "%s", "arguments": %s}</tool_call>' % (fn["name"], json.dumps(args))
+
+
 async def build_prompt(messages, tools, model, is_first_message=False):
     final_prompt = ""
     tools_extract = await extract_tools(tools)
     tool_instructions = (
         "TOOL USE INSTRUCTIONS:\n"
         "You have access to tools. When you need to call a tool, output ONLY the tool call XML block and nothing else:\n"
-        "<tool_call>{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}</tool_call>\n"
+        f"{_tool_call_example(tools)}\n"
+        "This shows the required FORMAT only: use the actual tool's name and real argument values for the task — never copy the placeholder <value> literals. "
         "Never repeat past messages, history, or XML tags. Output exactly one tool call block when invoking a tool."
     )
     if is_first_message:
