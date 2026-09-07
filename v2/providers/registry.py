@@ -1,11 +1,12 @@
 """Provider registry — maps model aliases to adapters."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 from v2.providers.base import ProviderAdapter, RenderedPrompt
 from v2.providers.fake import FakeProvider
+from v2.providers.deepseek import DeepSeekAdapter
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,6 +24,10 @@ class ProviderRegistry:
         self._adapters: dict[str, ProviderAdapter] = {}
         self._models: dict[str, ModelConfig] = {}
         self._default_provider = "fake"
+
+        # Register built-in adapters
+        self.register(FakeProvider())
+        self.register(DeepSeekAdapter())
 
     def register(self, provider: ProviderAdapter) -> "ProviderRegistry":
         self._adapters[provider.name] = provider

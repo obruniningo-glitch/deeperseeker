@@ -16,6 +16,7 @@ from v2.providers.base import (
 )
 from v2.providers.fake import FakeProvider
 from v2.providers.registry import ProviderRegistry, get_registry
+from v2.providers.deepseek import DeepSeekAdapter
 
 __all__ = [
     "ProviderAdapter",
@@ -30,6 +31,7 @@ __all__ = [
     "ProviderHealth",
     "RenderedPrompt",
     "FakeProvider",
+    "DeepSeekAdapter",
     "ProviderRegistry",
     "get_registry",
 ]
