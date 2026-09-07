@@ -24,6 +24,12 @@ class Settings(BaseSettings):
     DB_PATH: str = "deeperseeker.db"
     ENCRYPTION_KEY: str | None = None
 
+    # Qwen provider settings
+    QWEN_ORIGIN: str = "https://chat.qwen.ai"
+    QWEN_COOKIE_PATH: str = Field(default="aws_cookies_qwen.json",
+                                   validation_alias=AliasChoices("QWEN_COOKIE_PATH", "DEEPSEEKER_QWEN_COOKIE_PATH"))
+    QWEN_TOKEN: str = Field(default="", validation_alias=AliasChoices("QWEN_TOKEN", "DEEPSEEKER_QWEN_TOKEN"))
+
     # Cache / compaction (v2 owns the same knobs as v1 for behavior parity)
     SIG_WINDOW_K: int = 8
     PROMPT_BUDGET: int = 24000

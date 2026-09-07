@@ -8,6 +8,12 @@ from v2.providers.base import ProviderAdapter, RenderedPrompt
 from v2.providers.fake import FakeProvider
 from v2.providers.deepseek import DeepSeekAdapter
 
+# Qwen adapter may not be installed; guard the import
+try:
+    from v2.providers.qwen.adapter import QwenAdapter  # type: ignore
+except ImportError:  # pragma: no cover
+    QwenAdapter = None  # type: ignore
+
 
 @dataclass(frozen=True, slots=True)
 class ModelConfig:
@@ -89,6 +95,13 @@ def get_registry() -> ProviderRegistry:
         _REGISTRY.register_model("expert", "deepseek", "deepseek-v4-pro")
         _REGISTRY.register_model("vision", "deepseek", "deepseek-v4-pro")
         _REGISTRY.default_provider = "fake"
+
+        # Register Qwen adapter (guarded — if qwen package is missing, skip)
+        if QwenAdapter is not None:
+            _REGISTRY.register(QwenAdapter())
+            _REGISTRY.register_model("qwen-instant", "qwen", "qwen3-max")
+            _REGISTRY.register_model("qwen-expert", "qwen", "qwen3-max-plus")
+
     return _REGISTRY
 
 
