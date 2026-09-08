@@ -239,6 +239,7 @@ async def create_new_chat(auth_token: str, model_type: str) -> str:
         "title": "新建对话",
         "models": [model_type],
         "chat_mode": "normal",
+        "chat_type": "t2t",
         "timestamp": timestamp,
         "project_id": "",
     }
@@ -372,6 +373,7 @@ async def send_message(
         "chat_id": chat_id,
         "chat_mode": "normal",
         "model": model_type,
+        "chat_type": "t2t",
         "parent_id": None,
         "messages": [
             {
