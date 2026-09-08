@@ -261,7 +261,7 @@ async def create_new_chat(auth_token: str, model_type: str) -> str:
             cookie_jar_dict = _parse_cookies(cookie_str_from_api)
 
     # Create curl_cffi session with Chrome impersonation and cookies
-    async with AsyncSession(impersonate="chrome150", cookies=cookie_jar_dict) as session:
+    async with AsyncSession(impersonate="chrome124", cookies=cookie_jar_dict) as session:
         result = await _http_post_json(
             session, url, headers, body, 20,
         )
@@ -417,7 +417,7 @@ async def send_message(
 
     collected: list = []
 
-    async with AsyncSession(impersonate="chrome150", cookies=cookie_jar_dict) as session:
+    async with AsyncSession(impersonate="chrome124", cookies=cookie_jar_dict) as session:
         collected, raw = await _collect_once(session, url, headers, body, 300)
         if is_punish_response(raw):
             # WAF slider challenge: drop the stale baxia bundle + cookies and
