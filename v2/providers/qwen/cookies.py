@@ -153,15 +153,18 @@ async def _primary_baxia_path() -> Optional[dict]:
             if not uid:
                 return None
 
+            # Full cookie jar via Playwright (includes HttpOnly cookies like
+            # the auth `token`, which document.cookie cannot see).
             try:
-                cookie_str = await context.cookies()
-                _ = cookie_str  # harvested below via document.cookie equivalent
+                jar = await context.cookies()
+                full_cookie = "; ".join(f'{c["name"]}={c["value"]}' for c in jar)
             except Exception:
-                pass
-            try:
-                doc_cookie = await page.evaluate("() => document.cookie || ''")
-            except Exception:
-                doc_cookie = ""
+                full_cookie = ""
+            if not full_cookie:
+                try:
+                    full_cookie = await page.evaluate("() => document.cookie || ''")
+                except Exception:
+                    full_cookie = ""
 
             await context.close()
 
@@ -172,7 +175,7 @@ async def _primary_baxia_path() -> Optional[dict]:
             bx_v = "2.5.37"
 
             return {"bx_ua": bx_ua, "bx_umidtoken": bx_umidtoken, "bx_v": bx_v,
-                    "ver": ver, "cookies": doc_cookie}
+                    "ver": ver, "cookies": full_cookie}
 
     except Exception:
         return None
