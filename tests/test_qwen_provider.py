@@ -353,64 +353,43 @@ def _sse(chunks):
 class TestWireFunctions:
     """Test the wire protocol functions."""
 
-    @patch("aiohttp.ClientSession.post")
-    def test_create_new_chat_success(self, mock_http, mock_cookies):
+    @patch("v2.providers.qwen.wire._http_post_json", new_callable=AsyncMock)
+    def test_create_new_chat_success(self, mock_post_json, mock_cookies):
         """Test create_new_chat success path."""
-
-        # Mock the response
-        mock_response = AsyncMock()
-        mock_response.status = 200
-        mock_response.json = AsyncMock(return_value={"success": True, "data": {"id": "chat-abc123"}})
-        mock_http.return_value.__aenter__.return_value = mock_response
+        mock_post_json.return_value = {"success": True, "data": {"id": "chat-abc123"}}
 
         chat_id = asyncio.run(create_new_chat("eyJtesttoken", "qwen3-max"))
         assert chat_id == "chat-abc123"
 
-    @patch("aiohttp.ClientSession.post")
-    def test_create_new_chat_with_data_id(self, mock_http, mock_cookies):
+    @patch("v2.providers.qwen.wire._http_post_json", new_callable=AsyncMock)
+    def test_create_new_chat_with_data_id(self, mock_post_json, mock_cookies):
         """Test create_new_chat with response shape {"data": {"id": "..."}}."""
-
-        mock_response = AsyncMock()
-        mock_response.status = 200
-        mock_response.json = AsyncMock(return_value={"data": {"id": "chat-def456"}})
-        mock_http.return_value.__aenter__.return_value = mock_response
+        mock_post_json.return_value = {"data": {"id": "chat-def456"}}
 
         chat_id = asyncio.run(create_new_chat("eyJtesttoken", "qwen3-max"))
         assert chat_id == "chat-def456"
 
-    @patch("aiohttp.ClientSession.post")
-    def test_create_new_chat_with_chat_id(self, mock_http, mock_cookies):
+    @patch("v2.providers.qwen.wire._http_post_json", new_callable=AsyncMock)
+    def test_create_new_chat_with_chat_id(self, mock_post_json, mock_cookies):
         """Test create_new_chat with response shape {"chat_id": "..."}."""
-
-        mock_response = AsyncMock()
-        mock_response.status = 200
-        mock_response.json = AsyncMock(return_value={"chat_id": "chat-ghi789"})
-        mock_http.return_value.__aenter__.return_value = mock_response
+        mock_post_json.return_value = {"chat_id": "chat-ghi789"}
 
         chat_id = asyncio.run(create_new_chat("eyJtesttoken", "qwen3-max"))
         assert chat_id == "chat-ghi789"
 
-    @patch("aiohttp.ClientSession.post")
-    def test_create_new_chat_failure(self, mock_http, mock_cookies):
+    @patch("v2.providers.qwen.wire._http_post_json", new_callable=AsyncMock)
+    def test_create_new_chat_failure(self, mock_post_json, mock_cookies):
         """Test create_new_chat failure with non-200 response."""
-
-        mock_response = AsyncMock()
-        mock_response.status = 500
-        mock_response.text = AsyncMock(return_value="Internal Server Error")
-        mock_http.return_value.__aenter__.return_value = mock_response
+        mock_post_json.side_effect = RuntimeError("HTTP 500: Internal Server Error")
 
         with pytest.raises(RuntimeError, match="HTTP 500"):
             asyncio.run(create_new_chat("eyJtesttoken", "qwen3-max"))
 
-    @patch("aiohttp.ClientSession.post")
-    def test_send_message_streaming(self, mock_http, mock_cookies):
+    @patch("v2.providers.qwen.wire._collect_once", new_callable=AsyncMock)
+    def test_send_message_streaming(self, mock_collect, mock_cookies):
         """Test send_message streaming events."""
+        from v2.providers.qwen.wire import _parse_sse_line
 
-        # Create a mock response with async iterable content
-        mock_response = AsyncMock()
-        mock_response.status = 200
-
-        # Simulate SSE events
         sse_events = [
             b'data: {"choices": [{"delta": {"reasoning_content": "Let me think..."}}]}\n\n',
             b'data: {"choices": [{"delta": {"content": "First step"}}]}\n\n',
@@ -418,30 +397,13 @@ class TestWireFunctions:
             b'data: {"choices": [{"finish_reason": "stop"}]}\n\n',
             b'data: [DONE]\n\n',
         ]
-
-        # Create a class that implements async iteration
-        class AsyncIterableContent:
-            def __init__(self, chunks):
-                self.chunks = chunks
-                self.index = 0
-
-            def __aiter__(self):
-                return self
-
-            async def __anext__(self):
-                if self.index >= len(self.chunks):
-                    raise StopAsyncIteration
-                chunk = self.chunks[self.index]
-                self.index += 1
-                return chunk
-
-            async def iter_any(self):
-                for chunk in self.chunks:
-                    yield chunk
-
-        # Set up the content with the async iterable
-        mock_response.content = AsyncIterableContent(sse_events)
-        mock_http.return_value.__aenter__.return_value = mock_response
+        want = []
+        for chunk in sse_events:
+            for event in _parse_sse_line(chunk):
+                want.append(event)
+                if event[0] == "finished":
+                    break
+        mock_collect.return_value = (list(want), b"data: [DONE]")
 
         events = []
         async def collect():
@@ -464,14 +426,10 @@ class TestWireFunctions:
         # The finish_reason triggers a finished event
         assert events[3][0] == "finished"
 
-    @patch("aiohttp.ClientSession.post")
-    def test_send_message_http_error(self, mock_http, mock_cookies):
+    @patch("v2.providers.qwen.wire._collect_once", new_callable=AsyncMock)
+    def test_send_message_http_error(self, mock_collect, mock_cookies):
         """Test send_message handles HTTP error gracefully."""
-
-        mock_response = AsyncMock()
-        mock_response.status = 429
-        mock_response.text = AsyncMock(return_value="Rate limit exceeded")
-        mock_http.return_value.__aenter__.return_value = mock_response
+        mock_collect.return_value = ([("error", "HTTP 429: Rate limit exceeded")], b"")
 
         events = []
         async def collect():
@@ -545,34 +503,30 @@ class TestQwenBaxiaTokens:
 class TestQwenWireShapes:
     """Request shapes per the qwen2api reference (core.js)."""
 
-    @patch("aiohttp.ClientSession.post")
-    def test_create_posts_full_body_and_headers(self, mock_http, mock_cookies):
+    @patch("v2.providers.qwen.wire._http_post_json", new_callable=AsyncMock)
+    def test_create_posts_full_body_and_headers(self, mock_post_json, mock_cookies):
         """chats/new is a POST with title/models/chat_mode + bx headers."""
-        mock_response = AsyncMock()
-        mock_response.status = 200
-        mock_response.json = AsyncMock(return_value={"success": True, "data": {"id": "c1"}})
-        mock_http.return_value.__aenter__.return_value = mock_response
+        mock_post_json.return_value = {"success": True, "data": {"id": "c1"}}
 
         asyncio.run(create_new_chat("eyJtok", "qwen3-max"))
 
-        _, kwargs = mock_http.call_args
-        sent = json.loads(kwargs["json"]) if isinstance(kwargs.get("json"), str) else kwargs.get("json")
+        _, kwargs = mock_post_json.call_args
+        # helper signature: (session, url, headers, json_body, timeout)
+        url = mock_post_json.call_args[0][1]
+        headers = mock_post_json.call_args[0][2]
+        sent = mock_post_json.call_args[0][3]
+        assert url.endswith("/chats/new")
         assert sent["models"] == ["qwen3-max"]
         assert sent["chat_mode"] == "normal"
         assert "timestamp" in sent
-        headers = kwargs["headers"]
         assert headers["bx-umidtoken"] == "T2gAv_test-baxia"
         assert headers["source"] == "web"
         assert "x-request-id" in headers
-        assert mock_http.call_args[0][0].endswith("/chats/new")
 
-    @patch("aiohttp.ClientSession.post")
-    def test_completions_uses_query_param_and_message_envelope(self, mock_http, mock_cookies):
+    @patch("v2.providers.qwen.wire._collect_once", new_callable=AsyncMock)
+    def test_completions_uses_query_param_and_message_envelope(self, mock_collect, mock_cookies):
         """completions POSTs to ?chat_id= with the fid/childrenIds envelope."""
-        mock_response = AsyncMock()
-        mock_response.status = 200
-        mock_response.content = _sse([b"data: [DONE]\n\n"])
-        mock_http.return_value.__aenter__.return_value = mock_response
+        mock_collect.return_value = ([("finished", None)], b"data: [DONE]")
 
         async def collect():
             async for _ in send_message(auth_token="eyJtok", chat_id="chat-9", message="hi"):
@@ -580,11 +534,81 @@ class TestQwenWireShapes:
 
         asyncio.run(collect())
 
-        url = mock_http.call_args[0][0]
+        # helper signature: _collect_once(session, url, headers, body, timeout)
+        url = mock_collect.call_args[0][1]
         assert url.endswith("/chat/completions?chat_id=chat-9")
-        sent = mock_http.call_args[1]["json"]
+        sent = mock_collect.call_args[0][3]
         assert sent["chat_mode"] == "normal"
         assert sent["version"] == "2.1"
         msg = sent["messages"][0]
         assert msg["role"] == "user" and msg["content"] == "hi"
         assert "fid" in msg and "childrenIds" in msg
+
+
+class TestPunishHandling:
+    """WAF slider-challenge detection and single refresh+retry."""
+
+    def test_is_punish_response(self):
+        from v2.providers.qwen.wire import is_punish_response
+
+        assert is_punish_response(b'{"ret":["FAIL_SYS_USER_VALIDATE","RGV587_ERROR::x"]}')
+        assert is_punish_response(b'<script>window.location.replace("https://x/_____tmd_____/punish?x=1")')
+        assert not is_punish_response(b'data: {"choices": [{"delta": {"content": "hi"}}]}')
+        assert not is_punish_response(b"data: [DONE]")
+
+    def test_punish_triggers_refresh_and_retry(self, mock_cookies):
+        """A punish body drops the cache, re-harvests once, and retries."""
+        from v2.providers.qwen import cookies as qc
+        from v2.providers.qwen import wire as W
+
+        calls = []
+
+        async def fake_collect(session, url, headers, body, timeout):
+            calls.append(dict(headers))
+            if len(calls) == 1:
+                return ([("finished", None)], b'{"ret":["FAIL_SYS_USER_VALIDATE"]}')
+            return ([("response", "hello"), ("finished", None)], b"data: [DONE]")
+
+        refreshed = {}
+
+        async def fake_bundle():
+            # First call (initial headers): stale bundle; second (retry): fresh.
+            if refreshed:
+                return {"bx_ua": "ua2", "bx_umidtoken": "T2gAv_fresh", "bx_v": "2.5.37",
+                        "cookies": "x-ap=eu"}
+            refreshed["done"] = True
+            return dict(_BAXIA_BUNDLE)
+
+        async def run():
+            with patch.object(W, "_collect_once", side_effect=fake_collect), \
+                 patch.object(W, "get_baxia_token_bundle", side_effect=fake_bundle):
+                events = []
+                async for ev in send_message(auth_token="eyJtok", chat_id="c1", message="hi"):
+                    events.append(ev)
+                return events
+
+        events = asyncio.run(run())
+        assert len(calls) == 2
+        assert calls[0]["bx-umidtoken"] == "T2gAv_test-baxia"
+        assert calls[1]["bx-umidtoken"] == "T2gAv_fresh"
+        assert ("response", "hello") in events
+
+    def test_persistent_punish_yields_clear_error(self, mock_cookies):
+        """Punish on both attempts yields a single actionable error event."""
+        from v2.providers.qwen import wire as W
+
+        async def fake_collect(session, url, headers, body, timeout):
+            return ([("finished", None)], b"RGV587 punish")
+
+        async def fake_bundle():
+            return dict(_BAXIA_BUNDLE)
+
+        async def run():
+            with patch.object(W, "_collect_once", side_effect=fake_collect), \
+                 patch.object(W, "get_baxia_token_bundle", side_effect=fake_bundle):
+                return [ev async for ev in send_message(
+                    auth_token="eyJtok", chat_id="c1", message="hi")]
+
+        events = asyncio.run(run())
+        assert len(events) == 1
+        assert events[0][0] == "error" and "slider" in events[0][1]

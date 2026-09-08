@@ -11,7 +11,7 @@ import time
 import uuid
 from typing import Any, AsyncIterator, Optional
 
-import aiohttp
+from curl_cffi.requests import AsyncSession
 
 from v2.providers.qwen.cookies import get_baxia_tokens, get_baxia_token
 from v2.settings import get_settings
@@ -43,6 +43,143 @@ def _build_base_headers(bx_ua: str, bx_umidtoken: str, bx_v: str) -> dict:
         "Accept-Language": settings.QWEN_ACCEPT_LANGUAGE or "zh-CN,zh;q=0.9,en;q=0.8",
         "x-request-id": uuid.uuid4().hex,
     }
+
+
+def _parse_sse_line(raw_line: bytes) -> list:
+    """Parse one raw SSE line into wire events.
+
+    Tolerates split/joined chunks ("data:" with or without trailing space,
+    multi-line JSON is handled by the caller's buffer, one line at a time).
+    Returns a list of ("thinking"|"response"|"finished", payload) tuples.
+    """
+    try:
+        decoded = raw_line.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return []
+    if not decoded.startswith("data:"):
+        return []
+    data_str = decoded[5:].strip()
+    if data_str == "[DONE]":
+        return [("finished", None)]
+    try:
+        data = json.loads(data_str)
+    except json.JSONDecodeError:
+        return []
+    # Parse OpenAI-compatible delta format
+    # Example: {"choices": [{"delta": {"reasoning_content": "...", "content": "..."}}]}
+    choices = data.get("choices", [])
+    if not choices:
+        return []
+    events = []
+    delta = choices[0].get("delta", {})
+    if delta:
+        reasoning = delta.get("reasoning_content")
+        if reasoning and isinstance(reasoning, str) and reasoning.strip():
+            events.append(("thinking", reasoning))
+        content = delta.get("content")
+        if content and isinstance(content, str) and content.strip():
+            events.append(("response", content))
+    finish_reason = choices[0].get("finish_reason")
+    if finish_reason:
+        events.append(("finished", None))
+    return events
+
+
+def _parse_cookies(cookie_str: str) -> dict:
+    """Convert a semicolon-separated cookie string into a dict for curl_cffi."""
+    ck: dict = {}
+    if not cookie_str:
+        return ck
+    for pair in cookie_str.split(";"):
+        if "=" in pair:
+            key, value = pair.split("=", 1)
+            if key.strip() and value.strip():
+                ck[key.strip()] = value.strip()
+    return ck
+
+
+async def _http_post_json(
+    session: AsyncSession,
+    url: str,
+    headers: dict,
+    json_body: dict,
+    timeout: float,
+) -> dict:
+    """Perform a POST with JSON body using curl_cffi, returning the parsed JSON response.
+
+    Raises RuntimeError on non-200 status, mirroring the original aiohttp behavior.
+    """
+    resp = await session.post(
+        url,
+        headers=headers,
+        json=json_body,
+        timeout=timeout,
+    )
+    if resp.status_code != 200:
+        error_text = resp.text[:200]
+        raise RuntimeError(
+            f"HTTP {resp.status_code} creating chat: {error_text}"
+        )
+    return resp.json()
+
+
+_PUNISH_MARKERS = (b"_____tmd_____/punish", b"FAIL_SYS_USER_VALIDATE", b"RGV587")
+
+
+def is_punish_response(body: bytes) -> bool:
+    """Detect the Alibaba WAF slider-challenge page in a response body."""
+    return any(m in body for m in _PUNISH_MARKERS)
+
+
+async def _http_post_stream(
+    session: AsyncSession,
+    url: str,
+    headers: dict,
+    json_body: dict,
+    timeout: float,
+    on_event,
+) -> None:
+    """Perform a POST with streaming SSE response using curl_cffi.
+
+    Feeds received bytes through the existing _parse_sse_line buffered parser
+    unchanged. Calls on_event(event_type, payload) for each parsed event.
+
+    Timeout yields ("error", "Request timeout") on asyncio.TimeoutError.
+    Curl errors yield ("error", f"Connection error: ...").
+    """
+    resp = await session.post(
+        url,
+        headers=headers,
+        json=json_body,
+        timeout=timeout,
+        stream=True,
+    )
+    if resp.status_code != 200:
+        error_text = resp.text[:200]
+        on_event(("error", f"HTTP {resp.status_code}: {error_text}"))
+        return
+
+    buf = b""
+    async for raw_line in resp.aiter_lines():
+        buf += raw_line + b"\n"
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            for event in _parse_sse_line(line):
+                if event[0] == "finished":
+                    on_event(event)
+                    return
+                on_event(event)
+
+    # Flush any remaining buffer
+    if buf.strip():
+        for event in _parse_sse_line(buf):
+            if event[0] == "finished":
+                on_event(event)
+                return
+            on_event(event)
+
+    # If we reach here without a [DONE] or finish_reason, still finish
+    on_event(("finished", None))
 
 
 async def get_baxia_token_bundle() -> Optional[dict]:
@@ -114,47 +251,36 @@ async def create_new_chat(auth_token: str, model_type: str) -> str:
 
     # Attach the real-browser cookies harvested alongside the baxia tokens
     # (qwen2api sends document.cookie as the Cookie header).
-    cookie_jar = aiohttp.CookieJar()
-    cookies_str = (bx_tokens or {}).get("cookies", "") if isinstance(bx_tokens, dict) else ""
-    if not cookies_str:
-        cookies_str = await get_baxia_tokens_from_cookies()
-    if cookies_str:
-        for pair in cookies_str.split("; "):
-            if "=" in pair:
-                key, value = pair.split("=", 1)
-                cookie_jar.update_cookies({key.strip(): value.strip()})
+    cookie_jar_dict = _parse_cookies(
+        (bx_tokens or {}).get("cookies", "") if isinstance(bx_tokens, dict) else ""
+    )
+    if not cookie_jar_dict:
+        cookie_str_from_api = await get_baxia_tokens_from_cookies()
+        if cookie_str_from_api:
+            cookie_jar_dict = _parse_cookies(cookie_str_from_api)
 
-    async with aiohttp.ClientSession(cookie_jar=cookie_jar) as session:
-        async with session.post(
-            url,
-            headers=headers,
-            json=body,
-            timeout=aiohttp.ClientTimeout(total=20),
-        ) as response:
-            if response.status != 200:
-                error_text = await response.text()
-                raise RuntimeError(
-                    f"HTTP {response.status} creating chat: {error_text[:200]}"
-                )
-
-            data = await response.json()
+    # Create curl_cffi session with Chrome impersonation and cookies
+    async with AsyncSession(impersonate="chrome150", cookies=cookie_jar_dict) as session:
+        result = await _http_post_json(
+            session, url, headers, body, 20,
+        )
 
     # Tolerantly extract chat id from various response shapes
     # Expected: {"id": "..."} or {"chat_id": "..."} or {"data": {"id": "..."}}
     chat_id = None
-    if isinstance(data, dict):
-        if "id" in data and isinstance(data["id"], str):
-            chat_id = data["id"]
-        elif "chat_id" in data and isinstance(data["chat_id"], str):
-            chat_id = data["chat_id"]
-        elif "data" in data and isinstance(data["data"], dict):
-            if "id" in data["data"] and isinstance(data["data"]["id"], str):
-                chat_id = data["data"]["id"]
-            elif "chat_id" in data["data"] and isinstance(data["data"]["chat_id"], str):
-                chat_id = data["data"]["chat_id"]
+    if isinstance(result, dict):
+        if "id" in result and isinstance(result["id"], str):
+            chat_id = result["id"]
+        elif "chat_id" in result and isinstance(result["chat_id"], str):
+            chat_id = result["chat_id"]
+        elif "data" in result and isinstance(result["data"], dict):
+            if "id" in result["data"] and isinstance(result["data"]["id"], str):
+                chat_id = result["data"]["id"]
+            elif "chat_id" in result["data"] and isinstance(result["data"]["chat_id"], str):
+                chat_id = result["data"]["chat_id"]
 
     if not chat_id:
-        raise RuntimeError(f"Could not extract chat id from response: {data}")
+        raise RuntimeError(f"Could not extract chat id from response: {result}")
 
     return chat_id
 
@@ -165,44 +291,27 @@ async def get_baxia_tokens_from_cookies() -> Optional[str]:
     return await get_cookies()
 
 
-def _parse_sse_line(raw_line: bytes) -> list:
-    """Parse one raw SSE line into wire events.
+async def _collect_once(session, url, headers, body, timeout) -> tuple[list, bytes]:
+    """Single completions attempt: returns (events, raw_body_for_punish_check)."""
+    from curl_cffi.requests import AsyncSession as _S  # noqa (type clarity)
 
-    Tolerates split/joined chunks ("data:" with or without trailing space,
-    multi-line JSON is handled by the caller's buffer, one line at a time).
-    Returns a list of ("thinking"|"response"|"finished", payload) tuples.
-    """
-    try:
-        decoded = raw_line.decode("utf-8").strip()
-    except UnicodeDecodeError:
-        return []
-    if not decoded.startswith("data:"):
-        return []
-    data_str = decoded[5:].strip()
-    if data_str == "[DONE]":
-        return [("finished", None)]
-    try:
-        data = json.loads(data_str)
-    except json.JSONDecodeError:
-        return []
-    # Parse OpenAI-compatible delta format
-    # Example: {"choices": [{"delta": {"reasoning_content": "...", "content": "..."}}]}
-    choices = data.get("choices", [])
-    if not choices:
-        return []
-    events = []
-    delta = choices[0].get("delta", {})
-    if delta:
-        reasoning = delta.get("reasoning_content")
-        if reasoning and isinstance(reasoning, str) and reasoning.strip():
-            events.append(("thinking", reasoning))
-        content = delta.get("content")
-        if content and isinstance(content, str) and content.strip():
-            events.append(("response", content))
-    finish_reason = choices[0].get("finish_reason")
-    if finish_reason:
-        events.append(("finished", None))
-    return events
+    collected: list = []
+    raw = b""
+    resp = await session.post(url, headers=headers, json=body, timeout=timeout, stream=True)
+    if resp.status_code != 200:
+        collected.append(("error", f"HTTP {resp.status_code}: {resp.text[:200]}"))
+        return collected, raw
+    async for chunk in resp.aiter_content():
+        raw += chunk
+    text = raw.decode("utf-8", "replace")
+    for line in text.split("\n"):
+        for event in _parse_sse_line(line.encode("utf-8", "replace")):
+            collected.append(event)
+            if event[0] == "finished":
+                return collected, raw
+    if not any(e[0] == "finished" for e in collected):
+        collected.append(("finished", None))
+    return collected, raw
 
 
 async def send_message(
@@ -296,54 +405,38 @@ async def send_message(
 
     # Same-page cookies: the document.cookie harvested alongside the baxia
     # tokens must ride on the completions call (qwen2api sends it as Cookie).
-    cookie_jar = aiohttp.CookieJar()
-    cookies_str = (bx_bundle or {}).get("cookies", "") if isinstance(bx_bundle, dict) else ""
-    if cookies_str:
-        for pair in cookies_str.split(";"):
-            if "=" in pair:
-                key, value = pair.split("=", 1)
-                key, value = key.strip(), value.strip()
-                if key and value:
-                    cookie_jar.update_cookies({key: value})
+    cookie_jar_dict = _parse_cookies(
+        (bx_bundle or {}).get("cookies", "") if isinstance(bx_bundle, dict) else ""
+    )
+    if not cookie_jar_dict:
+        cookie_str_from_api = await get_baxia_tokens_from_cookies()
+        if cookie_str_from_api:
+            cookie_jar_dict = _parse_cookies(cookie_str_from_api)
 
-    try:
-        async with aiohttp.ClientSession(cookie_jar=cookie_jar) as session:
-            async with session.post(
-                url,
-                headers=headers,
-                json=body,
-                timeout=aiohttp.ClientTimeout(total=300),
-            ) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    yield ("error", f"HTTP {response.status}: {error_text[:200]}")
-                    return
+    collected: list = []
 
-                # Buffered SSE parse: chunks may split or join data: lines, and
-                # the prefix may be "data:" with or without a trailing space.
-                buf = b""
-                async for chunk in response.content.iter_any():
-                    buf += chunk
-                    while b"\n" in buf:
-                        raw_line, buf = buf.split(b"\n", 1)
-                        for event in _parse_sse_line(raw_line):
-                            if event[0] == "finished":
-                                yield event
-                                return
-                            yield event
+    async with AsyncSession(impersonate="chrome150", cookies=cookie_jar_dict) as session:
+        collected, raw = await _collect_once(session, url, headers, body, 300)
+        if is_punish_response(raw):
+            # WAF slider challenge: drop the stale baxia bundle + cookies and
+            # re-harvest once, then retry a single time (qwengate recipe).
+            from v2.providers.qwen import cookies as _qc
 
-                for event in _parse_sse_line(buf):
-                    if event[0] == "finished":
-                        yield event
-                        return
-                    yield event
+            _qc._baxia_token_cache = None
+            _qc._baxia_cache_time = 0.0
+            fresh = await get_baxia_token_bundle()
+            if fresh is not None:
+                headers["bx-ua"] = fresh["bx_ua"]
+                headers["bx-umidtoken"] = fresh["bx_umidtoken"]
+                headers["bx-v"] = fresh.get("bx_v", _DEFAULT_BX_V)
+                jar2 = _parse_cookies(fresh.get("cookies", ""))
+                if jar2:
+                    cookie_jar_dict = jar2
+                    session.cookies.update(jar2)
+                collected, raw = await _collect_once(session, url, headers, body, 300)
+                if is_punish_response(raw):
+                    collected = [("error", "WAF slider challenge (punish) after refresh; "
+                                           "solve it in the browser, then retry")]
 
-                # If we reach here without a [DONE] or finish_reason, still finish
-                yield ("finished", None)
-
-    except asyncio.TimeoutError:
-        yield ("error", "Request timeout")
-    except aiohttp.ClientError as e:
-        yield ("error", f"Connection error: {str(e)}")
-    except Exception as e:
-        yield ("error", f"Unexpected error: {str(e)}")
+    for event in collected:
+        yield event

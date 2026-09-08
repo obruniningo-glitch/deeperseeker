@@ -1,6 +1,7 @@
 wasmtime
 playwright
 aiohttp
+curl_cffi
 uvicorn
 fastapi
 python-multipart
