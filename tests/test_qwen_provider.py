@@ -341,6 +341,10 @@ class _SSEContent:
         self.index += 1
         return chunk
 
+    async def iter_any(self):
+        for chunk in self.chunks:
+            yield chunk
+
 
 def _sse(chunks):
     return _SSEContent(chunks)
@@ -430,6 +434,10 @@ class TestWireFunctions:
                 chunk = self.chunks[self.index]
                 self.index += 1
                 return chunk
+
+            async def iter_any(self):
+                for chunk in self.chunks:
+                    yield chunk
 
         # Set up the content with the async iterable
         mock_response.content = AsyncIterableContent(sse_events)

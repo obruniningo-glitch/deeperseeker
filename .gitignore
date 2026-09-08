@@ -5,3 +5,9 @@ deeperseeker.db
 .venv/
 .env
 .omo/
+qwen_profile/
+qwen_session.json
+qwen_jwt.txt
+qwen_cookies.json
+.qwen_login_done
+deeperseeker_v2.db*

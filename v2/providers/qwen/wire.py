@@ -46,13 +46,15 @@ def _build_base_headers(bx_ua: str, bx_umidtoken: str, bx_v: str) -> dict:
 
 
 async def get_baxia_token_bundle() -> Optional[dict]:
-    """Fetch baxia token bundle: {bx_ua, bx_umidtoken, bx_v}.
+    """Fetch baxia token bundle: {bx_ua, bx_umidtoken, bx_v, cookies}.
 
     Mirrors the get_baxia_tokens() from cookies.py. Returns None on failure.
     """
     tokens = await get_baxia_tokens()
     if tokens is not None:
-        return {"bx_ua": tokens["bx_ua"], "bx_umidtoken": tokens["bx_umidtoken"], "bx_v": tokens.get("bx_v", _DEFAULT_BX_V)}
+        return {"bx_ua": tokens["bx_ua"], "bx_umidtoken": tokens["bx_umidtoken"],
+                "bx_v": tokens.get("bx_v", _DEFAULT_BX_V),
+                "cookies": tokens.get("cookies", "")}
     return None
 
 
@@ -110,14 +112,17 @@ async def create_new_chat(auth_token: str, model_type: str) -> str:
     # Add Authorization header last (overrides any duplicate from _build_base_headers)
     headers["Authorization"] = f"Bearer {auth_token}"
 
-    # Add Cookie jar if available
-    cookies_str = await get_baxia_tokens_from_cookies()
+    # Attach the real-browser cookies harvested alongside the baxia tokens
+    # (qwen2api sends document.cookie as the Cookie header).
     cookie_jar = aiohttp.CookieJar()
+    cookies_str = (bx_tokens or {}).get("cookies", "") if isinstance(bx_tokens, dict) else ""
+    if not cookies_str:
+        cookies_str = await get_baxia_tokens_from_cookies()
     if cookies_str:
         for pair in cookies_str.split("; "):
             if "=" in pair:
                 key, value = pair.split("=", 1)
-                cookie_jar.update_cookies({key: value})
+                cookie_jar.update_cookies({key.strip(): value.strip()})
 
     async with aiohttp.ClientSession(cookie_jar=cookie_jar) as session:
         async with session.post(
@@ -158,6 +163,46 @@ async def get_baxia_tokens_from_cookies() -> Optional[str]:
     """Get cookie string from the cookie cache (helper for wire.py)."""
     from v2.providers.qwen.cookies import get_cookies
     return await get_cookies()
+
+
+def _parse_sse_line(raw_line: bytes) -> list:
+    """Parse one raw SSE line into wire events.
+
+    Tolerates split/joined chunks ("data:" with or without trailing space,
+    multi-line JSON is handled by the caller's buffer, one line at a time).
+    Returns a list of ("thinking"|"response"|"finished", payload) tuples.
+    """
+    try:
+        decoded = raw_line.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return []
+    if not decoded.startswith("data:"):
+        return []
+    data_str = decoded[5:].strip()
+    if data_str == "[DONE]":
+        return [("finished", None)]
+    try:
+        data = json.loads(data_str)
+    except json.JSONDecodeError:
+        return []
+    # Parse OpenAI-compatible delta format
+    # Example: {"choices": [{"delta": {"reasoning_content": "...", "content": "..."}}]}
+    choices = data.get("choices", [])
+    if not choices:
+        return []
+    events = []
+    delta = choices[0].get("delta", {})
+    if delta:
+        reasoning = delta.get("reasoning_content")
+        if reasoning and isinstance(reasoning, str) and reasoning.strip():
+            events.append(("thinking", reasoning))
+        content = delta.get("content")
+        if content and isinstance(content, str) and content.strip():
+            events.append(("response", content))
+    finish_reason = choices[0].get("finish_reason")
+    if finish_reason:
+        events.append(("finished", None))
+    return events
 
 
 async def send_message(
@@ -249,8 +294,20 @@ async def send_message(
     headers["Authorization"] = f"Bearer {auth_token}"
     headers["Accept"] = "text/event-stream"
 
+    # Same-page cookies: the document.cookie harvested alongside the baxia
+    # tokens must ride on the completions call (qwen2api sends it as Cookie).
+    cookie_jar = aiohttp.CookieJar()
+    cookies_str = (bx_bundle or {}).get("cookies", "") if isinstance(bx_bundle, dict) else ""
+    if cookies_str:
+        for pair in cookies_str.split(";"):
+            if "=" in pair:
+                key, value = pair.split("=", 1)
+                key, value = key.strip(), value.strip()
+                if key and value:
+                    cookie_jar.update_cookies({key: value})
+
     try:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(cookie_jar=cookie_jar) as session:
             async with session.post(
                 url,
                 headers=headers,
@@ -262,53 +319,27 @@ async def send_message(
                     yield ("error", f"HTTP {response.status}: {error_text[:200]}")
                     return
 
-                async for line in response.content:
-                    if not line:
-                        continue
+                # Buffered SSE parse: chunks may split or join data: lines, and
+                # the prefix may be "data:" with or without a trailing space.
+                buf = b""
+                async for chunk in response.content.iter_any():
+                    buf += chunk
+                    while b"\n" in buf:
+                        raw_line, buf = buf.split(b"\n", 1)
+                        for event in _parse_sse_line(raw_line):
+                            if event[0] == "finished":
+                                yield event
+                                return
+                            yield event
 
-                    try:
-                        decoded = line.decode("utf-8").strip()
-                    except UnicodeDecodeError:
-                        continue
-
-                    if not decoded.startswith("data: "):
-                        continue
-
-                    data_str = decoded[6:].strip()
-                    if data_str == "[DONE]":
-                        yield ("finished", None)
+                for event in _parse_sse_line(buf):
+                    if event[0] == "finished":
+                        yield event
                         return
+                    yield event
 
-                    try:
-                        data = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        continue
-
-                    # Parse OpenAI-compatible delta format
-                    # Example: {"choices": [{"delta": {"reasoning_content": "...", "content": "..."}}]}
-                    choices = data.get("choices", [])
-                    if not choices:
-                        continue
-
-                    delta = choices[0].get("delta", {})
-                    if not delta:
-                        continue
-
-                    # Check for reasoning/thinking content
-                    reasoning = delta.get("reasoning_content")
-                    if reasoning and isinstance(reasoning, str) and reasoning.strip():
-                        yield ("thinking", reasoning)
-
-                    # Check for response content
-                    content = delta.get("content")
-                    if content and isinstance(content, str) and content.strip():
-                        yield ("response", content)
-
-                    # Check for finish_reason
-                    finish_reason = choices[0].get("finish_reason")
-                    if finish_reason:
-                        yield ("finished", None)
-                        return
+                # If we reach here without a [DONE] or finish_reason, still finish
+                yield ("finished", None)
 
     except asyncio.TimeoutError:
         yield ("error", "Request timeout")

@@ -85,64 +85,103 @@ async def get_baxia_token() -> Optional[str]:
     return None
 
 
-async def _primary_baxia_path() -> Optional[dict]:
-    """Primary path: Playwright headless Chromium → getFYModule from Baxia SDK.
+def _get_profile_dir() -> str:
+    """Persistent Chromium profile dir (survives restarts; holds WAF clearance)."""
+    settings = get_settings()
+    path = settings.QWEN_PROFILE_DIR
+    if not os.path.isabs(path):
+        repo_root = os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        )
+        path = os.path.join(repo_root, path)
+    os.makedirs(path, exist_ok=True)
+    return path
 
-    Loads https://chat.qwen.ai/ and extracts tokens via JavaScript evaluation.
-    Returns dict {bx_ua, bx_umidtoken, bx_v} or None if it fails.
+
+async def _primary_baxia_path() -> Optional[dict]:
+    """Primary path: Playwright Chromium (persistent profile) → getFYModule.
+
+    Uses a PERSISTENT profile dir so WAF clearance cookies (acw_tc/acw_sc,
+    baxia session) survive across runs. First run needs an interactive
+    challenge solve via qwen_login.py; later runs reuse the clearance.
+    Returns dict {bx_ua, bx_umidtoken, bx_v, ver, cookies} or None.
     """
+    browser = None
     try:
         async with async_playwright() as p:
             launch_kwargs = {"headless": True}
             if hasattr(os, "geteuid") and os.geteuid() == 0:
                 launch_kwargs["args"] = ["--no-sandbox"]
 
-            async with p.chromium.launch(**launch_kwargs) as browser:
-                context = await browser.new_context()
-                page = await context.new_page()
-                await page.goto("https://chat.qwen.ai/", wait_until="domcontentloaded")
+            # Explicit launch/close: Browser is not used as a context manager
+            # (async with on the launch coroutine never awaits it).
+            browser = await p.chromium.launch_persistent_context(
+                _get_profile_dir(), **launch_kwargs)
+            context = browser
+            page = await context.new_page()
+            await page.goto("https://chat.qwen.ai/", wait_until="domcontentloaded")
 
-                # Wait for anti-bot tokens to be set via JavaScript
-                await asyncio.sleep(2)
+            # The uid token materializes a few seconds after load (~4s observed);
+            # poll until it is present instead of a fixed sleep.
+            uid = ""
+            fy = ""
+            ver = ""
+            for _ in range(60):  # 60 attempts x 500ms = 30s
+                try:
+                    js_code = (
+                        "(function(){"
+                        "var fm = (window.__baxia__||{}).getFYModule;"
+                        "if (!fm || !fm.fyObj) return { ready: false };"
+                        "var u = ''; var f = '';"
+                        "try { u = String(fm.getUidToken()); } catch(e) {}"
+                        "try { f = String(fm.getFYToken()); } catch(e) {}"
+                        "if (!u || u === 'undefined' || u.length <= 20) return { ready: false };"
+                        "return { ready: true, uid: u, fy: f, ver: fm.fyObj.ver || '' };"
+                        "})()"
+                    )
+                    result = await page.evaluate(js_code)
+                    if result and result.get("ready"):
+                        uid = result.get("uid", "")
+                        fy = result.get("fy", "")
+                        ver = result.get("ver", "")
+                        if uid and re.match(r"^T2gA", uid) and len(uid) > 20:
+                            break
+                except Exception:
+                    pass
+                await asyncio.sleep(0.5)
 
-                # Retry evaluate for up to ~30s waiting for window.__baxia__.getFYModule
-                uid = ""
-                fy = ""
-                for attempt in range(60):  # 60 attempts × 500ms = 30s
-                    try:
-                        # Evaluate the FYModule check
-                        js_code = (
-                            "(function(){"
-                            "var fm = (window.__baxia__||{}).getFYModule;"
-                            "if (!fm || !fm.fyObj) return { ready: false };"
-                            "var uid = String(fm.getUidToken());"
-                            "var fy = String(fm.getFYToken());"
-                            "return { ready: true, uid: uid, fy: fy, ver: fm.fyObj.ver || '' };"
-                            "})()"
-                        )
-                        result = await page.evaluate(js_code, return_by_value=True)
-                        if result and result.get("ready"):
-                            uid = result.get("uid", "")
-                            fy = result.get("fy", "")
-                            # Accept only if uid matches ^T2gA and len > 20
-                            if uid and re.match(r"^T2gA", uid) and len(uid) > 20:
-                                break
-                    except Exception:
-                        pass
-                    await asyncio.sleep(0.5)
+            if not uid:
+                return None
 
-                await context.close()
+            try:
+                cookie_str = await context.cookies()
+                _ = cookie_str  # harvested below via document.cookie equivalent
+            except Exception:
+                pass
+            try:
+                doc_cookie = await page.evaluate("() => document.cookie || ''")
+            except Exception:
+                doc_cookie = ""
 
-                # Build result: bx_ua = fy (or '231!'+uid if fy empty),
-                # bx_umidtoken = uid, bx_v = '2.5.37'
-                bx_ua = fy if fy else f"231!{uid}"
-                bx_umidtoken = uid
-                bx_v = "2.5.37"
+            await context.close()
 
-                return {"bx_ua": bx_ua, "bx_umidtoken": bx_umidtoken, "bx_v": bx_v}
+            # Build result: bx_ua = fy (or '231!'+uid if fy empty),
+            # bx_umidtoken = uid, bx_v = '2.5.37'
+            bx_ua = fy if fy else f"231!{uid}"
+            bx_umidtoken = uid
+            bx_v = "2.5.37"
+
+            return {"bx_ua": bx_ua, "bx_umidtoken": bx_umidtoken, "bx_v": bx_v,
+                    "ver": ver, "cookies": doc_cookie}
 
     except Exception:
         return None
+    finally:
+        if browser is not None:
+            try:
+                await browser.close()
+            except Exception:
+                pass
 
 
 def _extract_wu_token(body_text: str) -> str:

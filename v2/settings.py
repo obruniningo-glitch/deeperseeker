@@ -31,6 +31,8 @@ class Settings(BaseSettings):
     QWEN_TOKEN: str = Field(default="", validation_alias=AliasChoices("QWEN_TOKEN", "DEEPSEEKER_QWEN_TOKEN"))
     QWEN_USER_AGENT: str = ""
     QWEN_ACCEPT_LANGUAGE: str = ""
+    QWEN_PROFILE_DIR: str = Field(default="qwen_profile",
+                                   validation_alias=AliasChoices("QWEN_PROFILE_DIR", "DEEPSEEKER_QWEN_PROFILE_DIR"))
 
     # Cache / compaction (v2 owns the same knobs as v1 for behavior parity)
     SIG_WINDOW_K: int = 8
