@@ -1,39 +1,215 @@
-"""Qwen cookie management — anti-bot token harvesting via Playwright.
+"""Qwen cookie management — baxia-token generation via Playwright headless Chromium.
 
-Qwen uses a JWT bearer token and an anti-bot token (baxia token).
+The baxia token has ~25-minute TTL and is prefixed with T2gAv_.
 The JWT bearer token is NOT stored here — only the baxia token is harvested
 and managed. Callers must provide the JWT token separately.
-The baxia token has ~25-minute TTL and is prefixed with T2gAv_.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import os
+import re
 import time
+import random
+import string
 from typing import Optional
 
+import aiohttp
 from playwright.async_api import async_playwright
 
 from v2.settings import get_settings
 
 
 _cookie_lock = asyncio.Lock()
+_baxia_token_cache: Optional[dict] = None
+_baxia_cache_time: float = 0.0
+
+
+def _random_suffix(length: int = 5) -> str:
+    """Generate a random alphanumeric suffix for fallback tokens."""
+    return "".join(random.choices(string.ascii_letters + string.digits, k=length))
 
 
 def _get_cookie_path() -> str:
     """Get the path to the Qwen cookie cache file."""
     settings = get_settings()
-    # If QWEN_COOKIE_PATH is relative, resolve it relative to the repo root
     path = settings.QWEN_COOKIE_PATH
     if not os.path.isabs(path):
-        # Resolve relative to the project root (where deeperseeker/ is)
-        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+        repo_root = os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        )
         path = os.path.join(repo_root, path)
     return path
 
 
-async def get_cookies() -> str | None:
+async def get_baxia_tokens() -> Optional[dict]:
+    """Get baxia tokens with cached TTL of ~25 minutes.
+
+    Returns a dict with keys: bx_ua, bx_umidtoken, bx_v
+    or None if both primary and fallback paths fail.
+    """
+    global _baxia_token_cache, _baxia_cache_time
+
+    now = time.time()
+    # Return cached token if still valid (25-minute TTL)
+    if _baxia_token_cache and (now - _baxia_cache_time) < 25 * 60:
+        return _baxia_token_cache
+
+    # Primary path: Playwright headless Chromium
+    result = await _primary_baxia_path()
+    if result is not None:
+        _baxia_token_cache = result
+        _baxia_cache_time = now
+        return _baxia_token_cache
+
+    # Fallback: HTTP GET to wu.json
+    result = await _fallback_wu_json_path()
+    if result is not None:
+        _baxia_token_cache = result
+        _baxia_cache_time = now
+        return _baxia_token_cache
+
+    # Both paths failed
+    return None
+
+
+async def get_baxia_token() -> Optional[str]:
+    """Get just the bx_umidtoken (umid) value from the baxia token cache.
+
+    Wrapper around get_baxia_tokens() for callers that only need the umid token.
+    """
+    tokens = await get_baxia_tokens()
+    if tokens is not None:
+        return tokens.get("bx_umidtoken")
+    return None
+
+
+async def _primary_baxia_path() -> Optional[dict]:
+    """Primary path: Playwright headless Chromium → getFYModule from Baxia SDK.
+
+    Loads https://chat.qwen.ai/ and extracts tokens via JavaScript evaluation.
+    Returns dict {bx_ua, bx_umidtoken, bx_v} or None if it fails.
+    """
+    try:
+        async with async_playwright() as p:
+            launch_kwargs = {"headless": True}
+            if hasattr(os, "geteuid") and os.geteuid() == 0:
+                launch_kwargs["args"] = ["--no-sandbox"]
+
+            async with p.chromium.launch(**launch_kwargs) as browser:
+                context = await browser.new_context()
+                page = await context.new_page()
+                await page.goto("https://chat.qwen.ai/", wait_until="domcontentloaded")
+
+                # Wait for anti-bot tokens to be set via JavaScript
+                await asyncio.sleep(2)
+
+                # Retry evaluate for up to ~30s waiting for window.__baxia__.getFYModule
+                uid = ""
+                fy = ""
+                for attempt in range(60):  # 60 attempts × 500ms = 30s
+                    try:
+                        # Evaluate the FYModule check
+                        js_code = (
+                            "(function(){"
+                            "var fm = (window.__baxia__||{}).getFYModule;"
+                            "if (!fm || !fm.fyObj) return { ready: false };"
+                            "var uid = String(fm.getUidToken());"
+                            "var fy = String(fm.getFYToken());"
+                            "return { ready: true, uid: uid, fy: fy, ver: fm.fyObj.ver || '' };"
+                            "})()"
+                        )
+                        result = await page.evaluate(js_code, return_by_value=True)
+                        if result and result.get("ready"):
+                            uid = result.get("uid", "")
+                            fy = result.get("fy", "")
+                            # Accept only if uid matches ^T2gA and len > 20
+                            if uid and re.match(r"^T2gA", uid) and len(uid) > 20:
+                                break
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.5)
+
+                await context.close()
+
+                # Build result: bx_ua = fy (or '231!'+uid if fy empty),
+                # bx_umidtoken = uid, bx_v = '2.5.37'
+                bx_ua = fy if fy else f"231!{uid}"
+                bx_umidtoken = uid
+                bx_v = "2.5.37"
+
+                return {"bx_ua": bx_ua, "bx_umidtoken": bx_umidtoken, "bx_v": bx_v}
+
+    except Exception:
+        return None
+
+
+def _extract_wu_token(body_text: str) -> str:
+    """Extract the umid token from a wu.json body.
+
+    Primary: umx.wu('...'). Fallback: first quoted string.
+    Returns "" when nothing is found.
+    """
+    m = re.search(r"umx\.wu\('([^']+)'\)", body_text)
+    if m:
+        return m.group(1)
+    qm = re.search(r"'([^']+)'", body_text)
+    return qm.group(1) if qm else ""
+
+
+async def _fallback_wu_json_path() -> Optional[dict]:
+    """Fallback path: plain HTTP GET https://sg-wum.alibaba.com/w/wu.json.
+
+    Extracts the umid token with regex umx.wu('...').
+    Falls back to first quoted string, then etag header.
+    Returns dict {bx_ua, bx_umidtoken, bx_v} or None.
+    """
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://sg-wum.alibaba.com/w/wu.json",
+                headers={"User-Agent":
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status != 200:
+                    return None
+
+                body_text = await resp.text()
+                bx_umidtoken = ""
+
+                # Primary regex: umx.wu('...')
+                m = re.search(r"umx\.wu\('([^']+)'\)", body_text)
+                if m:
+                    bx_umidtoken = m.group(1)
+                else:
+                    # Fallback 1: first quoted string in the body
+                    qm = re.search(r"'([^']+)'", body_text)
+                    if qm:
+                        bx_umidtoken = qm.group(1)
+                    else:
+                        # Fallback 2: etag header
+                        bx_umidtoken = resp.headers.get("etag", "")
+
+                # Ensure the token starts with T2gA; if not, prepend it
+                if bx_umidtoken and not re.match(r"^T2gA", bx_umidtoken):
+                    bx_umidtoken = "T2gA" + bx_umidtoken
+
+                # If we have an umid token, build bx_ua and return
+                if bx_umidtoken:
+                    token_suffix = _random_suffix(5)
+                    bx_ua = f"231!{bx_umidtoken}"
+                    bx_v = "2.5.36"
+                    return {"bx_ua": bx_ua, "bx_umidtoken": bx_umidtoken, "bx_v": bx_v}
+
+        return None
+
+    except Exception:
+        return None
+
+
+async def get_cookies() -> Optional[str]:
     """Get valid Qwen cookie string (cached or regenerated).
 
     Returns the cookie string (semicolon-separated) or None if
@@ -48,7 +224,6 @@ async def get_cookies() -> str | None:
             cookie_str = data.get("cookie")
             expiry = data.get("expiry")
             if cookie_str and expiry and expiry > time.time():
-                # Verify the cookie string contains a baxia token (T2gAv_ prefix)
                 if "T2gAv_" in cookie_str:
                     return cookie_str
     except Exception:
@@ -58,7 +233,7 @@ async def get_cookies() -> str | None:
         return await _regenerate_cookies()
 
 
-async def _regenerate_cookies() -> str | None:
+async def _regenerate_cookies() -> Optional[str]:
     """Regenerate cookies via Playwright (headless).
 
     Navigates to chat.qwen.ai, waits for the page to load, and harvests
@@ -98,7 +273,6 @@ async def _regenerate_cookies() -> str | None:
         expiry = None
         for c in cookies:
             cookie_dict[c["name"]] = c["value"]
-            # Use the earliest expiry among cookies as the cache expiry
             if c.get("expires"):
                 c_expiry = c["expires"]
                 if expiry is None or c_expiry < expiry:
@@ -144,8 +318,8 @@ def _encode_cookie_value(cookies: dict[str, str]) -> str:
     return "; ".join(f"{k}={v}" for k, v in cookies.items())
 
 
-async def get_baxia_token() -> str | None:
-    """Get the baxia anti-bot token from cookies.
+async def get_baxia_token_from_cookies() -> Optional[str]:
+    """Get the baxia anti-bot token from cookies (deprecated alias).
 
     Returns the token value (string) or None if not found.
     The token is prefixed with T2gAv_ and has ~25-minute TTL.

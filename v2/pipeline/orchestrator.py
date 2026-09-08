@@ -117,7 +117,11 @@ class Orchestrator:
         rendered.tools = spec.tools
         rendered.max_tokens = spec.max_tokens
         rendered.temperature = spec.temperature
-        rendered.metadata = spec.metadata
+        rendered.metadata = dict(spec.metadata) if spec.metadata else {}
+
+        # The adapter sends under the credential of the token the pool just
+        # picked for this provider — never a caller-supplied placeholder.
+        rendered.metadata["auth_token"] = self._token_repo.decrypt_secret(token)
 
         # 6. Send to provider (non-streaming via stream + collect)
         opts: SendOptions = {

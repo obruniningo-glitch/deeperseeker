@@ -204,7 +204,7 @@ def create_app() -> FastAPI:
 
         # Apply request-level overrides
         metadata = {
-            "auth_token": get_settings().API_KEY,  # In v2, we use the pool; this is for adapter metadata
+            # auth_token is injected by the orchestrator from the provider token pool
             "thinking": request.thinking,
             "search": request.search,
             "file_ids": request.file_ids or [],

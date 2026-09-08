@@ -28,17 +28,14 @@ def qwen_adapter():
     return QwenAdapter()
 
 
+_BAXIA_BUNDLE = {"bx_ua": "test-ua", "bx_umidtoken": "T2gAv_test-baxia", "bx_v": "2.5.37"}
+
+
 @pytest.fixture
 def mock_cookies():
-    """Mock cookie functions to avoid Playwright."""
-    with patch("v2.providers.qwen.adapter.get_qwen_cookies") as mock_get_cookies:
-        mock_get_cookies.return_value = "T2gAv_test-token"
-        with patch("v2.providers.qwen.wire.get_cookies") as mock_wire_cookies:
-            mock_wire_cookies.return_value = "T2gAv_test-token"
-            with patch("v2.providers.qwen.wire.get_baxia_token") as mock_baxia:
-                mock_baxia.return_value = "T2gAv_test-baxia"
-                with patch("v2.providers.qwen.adapter._regenerate_cookies"):
-                    yield
+    """Mock baxia token generation to avoid Playwright/network."""
+    with patch("v2.providers.qwen.wire.get_baxia_token_bundle", return_value=_BAXIA_BUNDLE),          patch("v2.providers.qwen.wire.get_baxia_token", return_value="T2gAv_test-baxia"):
+        yield
 
 
 class TestQwenAdapterCapabilities:
@@ -91,7 +88,7 @@ class TestQwenAdapterEnsureChat:
         assert session.chat_id == "chat-123"
         assert session.parent_message_id == 0
         assert session.token_id == 0
-        mock_create_chat.assert_called_once_with(token)
+        mock_create_chat.assert_called_once_with(token, "qwen3-max")
 
     @patch("v2.providers.qwen.wire.create_new_chat")
     def test_ensure_chat_resumes_existing_session(self, mock_create_chat, qwen_adapter, mock_cookies):
@@ -327,81 +324,83 @@ class TestRegistryIntegration:
         assert isinstance(adapter, QwenAdapter)
 
 
+class _SSEContent:
+    """Async-iterable stand-in for aiohttp response.content."""
+
+    def __init__(self, chunks):
+        self.chunks = chunks
+        self.index = 0
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self.index >= len(self.chunks):
+            raise StopAsyncIteration
+        chunk = self.chunks[self.index]
+        self.index += 1
+        return chunk
+
+
+def _sse(chunks):
+    return _SSEContent(chunks)
+
+
 class TestWireFunctions:
     """Test the wire protocol functions."""
 
-    @patch("v2.providers.qwen.wire.get_baxia_token")
-    @patch("v2.providers.qwen.wire.get_cookies")
-    @patch("aiohttp.ClientSession.get")
-    def test_create_new_chat_success(self, mock_get, mock_cookies, mock_baxia):
+    @patch("aiohttp.ClientSession.post")
+    def test_create_new_chat_success(self, mock_http, mock_cookies):
         """Test create_new_chat success path."""
-        mock_cookies.return_value = "T2gAv_test-token"
-        mock_baxia.return_value = "T2gAv_test-baxia"
 
         # Mock the response
         mock_response = AsyncMock()
         mock_response.status = 200
-        mock_response.json = AsyncMock(return_value={"id": "chat-abc123"})
-        mock_get.return_value.__aenter__.return_value = mock_response
+        mock_response.json = AsyncMock(return_value={"success": True, "data": {"id": "chat-abc123"}})
+        mock_http.return_value.__aenter__.return_value = mock_response
 
-        chat_id = asyncio.run(create_new_chat("eyJtesttoken"))
+        chat_id = asyncio.run(create_new_chat("eyJtesttoken", "qwen3-max"))
         assert chat_id == "chat-abc123"
 
-    @patch("v2.providers.qwen.wire.get_baxia_token")
-    @patch("v2.providers.qwen.wire.get_cookies")
-    @patch("aiohttp.ClientSession.get")
-    def test_create_new_chat_with_data_id(self, mock_get, mock_cookies, mock_baxia):
+    @patch("aiohttp.ClientSession.post")
+    def test_create_new_chat_with_data_id(self, mock_http, mock_cookies):
         """Test create_new_chat with response shape {"data": {"id": "..."}}."""
-        mock_cookies.return_value = "T2gAv_test-token"
-        mock_baxia.return_value = "T2gAv_test-baxia"
 
         mock_response = AsyncMock()
         mock_response.status = 200
         mock_response.json = AsyncMock(return_value={"data": {"id": "chat-def456"}})
-        mock_get.return_value.__aenter__.return_value = mock_response
+        mock_http.return_value.__aenter__.return_value = mock_response
 
-        chat_id = asyncio.run(create_new_chat("eyJtesttoken"))
+        chat_id = asyncio.run(create_new_chat("eyJtesttoken", "qwen3-max"))
         assert chat_id == "chat-def456"
 
-    @patch("v2.providers.qwen.wire.get_baxia_token")
-    @patch("v2.providers.qwen.wire.get_cookies")
-    @patch("aiohttp.ClientSession.get")
-    def test_create_new_chat_with_chat_id(self, mock_get, mock_cookies, mock_baxia):
+    @patch("aiohttp.ClientSession.post")
+    def test_create_new_chat_with_chat_id(self, mock_http, mock_cookies):
         """Test create_new_chat with response shape {"chat_id": "..."}."""
-        mock_cookies.return_value = "T2gAv_test-token"
-        mock_baxia.return_value = "T2gAv_test-baxia"
 
         mock_response = AsyncMock()
         mock_response.status = 200
         mock_response.json = AsyncMock(return_value={"chat_id": "chat-ghi789"})
-        mock_get.return_value.__aenter__.return_value = mock_response
+        mock_http.return_value.__aenter__.return_value = mock_response
 
-        chat_id = asyncio.run(create_new_chat("eyJtesttoken"))
+        chat_id = asyncio.run(create_new_chat("eyJtesttoken", "qwen3-max"))
         assert chat_id == "chat-ghi789"
 
-    @patch("v2.providers.qwen.wire.get_baxia_token")
-    @patch("v2.providers.qwen.wire.get_cookies")
-    @patch("aiohttp.ClientSession.get")
-    def test_create_new_chat_failure(self, mock_get, mock_cookies, mock_baxia):
+    @patch("aiohttp.ClientSession.post")
+    def test_create_new_chat_failure(self, mock_http, mock_cookies):
         """Test create_new_chat failure with non-200 response."""
-        mock_cookies.return_value = "T2gAv_test-token"
-        mock_baxia.return_value = "T2gAv_test-baxia"
 
         mock_response = AsyncMock()
         mock_response.status = 500
         mock_response.text = AsyncMock(return_value="Internal Server Error")
-        mock_get.return_value.__aenter__.return_value = mock_response
+        mock_http.return_value.__aenter__.return_value = mock_response
 
         with pytest.raises(RuntimeError, match="HTTP 500"):
-            asyncio.run(create_new_chat("eyJtesttoken"))
+            asyncio.run(create_new_chat("eyJtesttoken", "qwen3-max"))
 
-    @patch("v2.providers.qwen.wire.get_baxia_token")
-    @patch("v2.providers.qwen.wire.get_cookies")
     @patch("aiohttp.ClientSession.post")
-    def test_send_message_streaming(self, mock_post, mock_cookies, mock_baxia):
+    def test_send_message_streaming(self, mock_http, mock_cookies):
         """Test send_message streaming events."""
-        mock_cookies.return_value = "T2gAv_test-token"
-        mock_baxia.return_value = "T2gAv_test-baxia"
 
         # Create a mock response with async iterable content
         mock_response = AsyncMock()
@@ -434,7 +433,7 @@ class TestWireFunctions:
 
         # Set up the content with the async iterable
         mock_response.content = AsyncIterableContent(sse_events)
-        mock_post.return_value.__aenter__.return_value = mock_response
+        mock_http.return_value.__aenter__.return_value = mock_response
 
         events = []
         async def collect():
@@ -457,18 +456,14 @@ class TestWireFunctions:
         # The finish_reason triggers a finished event
         assert events[3][0] == "finished"
 
-    @patch("v2.providers.qwen.wire.get_baxia_token")
-    @patch("v2.providers.qwen.wire.get_cookies")
     @patch("aiohttp.ClientSession.post")
-    def test_send_message_http_error(self, mock_post, mock_cookies, mock_baxia):
+    def test_send_message_http_error(self, mock_http, mock_cookies):
         """Test send_message handles HTTP error gracefully."""
-        mock_cookies.return_value = "T2gAv_test-token"
-        mock_baxia.return_value = "T2gAv_test-baxia"
 
         mock_response = AsyncMock()
         mock_response.status = 429
         mock_response.text = AsyncMock(return_value="Rate limit exceeded")
-        mock_post.return_value.__aenter__.return_value = mock_response
+        mock_http.return_value.__aenter__.return_value = mock_response
 
         events = []
         async def collect():
@@ -493,3 +488,95 @@ class TestQwenAdapterUploadFile:
         """Test that upload_file raises NotImplementedError."""
         with pytest.raises(NotImplementedError, match="not yet implemented"):
             asyncio.run(qwen_adapter.upload_file("token", b"data", "file.txt", "text/plain"))
+
+
+class TestQwenBaxiaTokens:
+    """Baxia token generation: cache, wu.json fallback, header wiring."""
+
+    @pytest.fixture(autouse=True)
+    def _fresh_cache(self):
+        from v2.providers.qwen import cookies as qc
+
+        qc._baxia_token_cache = None
+        qc._baxia_cache_time = 0.0
+        yield
+        qc._baxia_token_cache = None
+        qc._baxia_cache_time = 0.0
+
+    def test_cache_reuse_within_ttl(self):
+        """Second call within 25 min reuses the cached bundle (no browser)."""
+        from v2.providers.qwen import cookies as qc
+
+        bundle = {"bx_ua": "ua1", "bx_umidtoken": "T2gAv_cached", "bx_v": "2.5.37"}
+        with patch.object(qc, "_primary_baxia_path", new=AsyncMock(return_value=bundle)) as prim, \
+             patch.object(qc, "_fallback_wu_json_path", new=AsyncMock(return_value=None)) as fb:
+            first = asyncio.run(qc.get_baxia_tokens())
+            second = asyncio.run(qc.get_baxia_tokens())
+        assert first == bundle and second == bundle
+        assert prim.await_count == 1
+        assert fb.await_count == 0
+
+    def test_fallback_wu_json_on_primary_failure(self):
+        """When the browser path fails, the wu.json path is used."""
+        from v2.providers.qwen import cookies as qc
+
+        fb_bundle = {"bx_ua": "231!T2gAv_fb", "bx_umidtoken": "T2gAv_fb", "bx_v": "2.5.36"}
+        with patch.object(qc, "_primary_baxia_path", new=AsyncMock(return_value=None)), \
+             patch.object(qc, "_fallback_wu_json_path", new=AsyncMock(return_value=fb_bundle)):
+            got = asyncio.run(qc.get_baxia_tokens())
+        assert got == fb_bundle
+
+    def test_wu_json_regex_extraction(self):
+        """wu.json body `try{umx.wu('T2gA...');}catch(e){}` yields the umid token."""
+        from v2.providers.qwen.cookies import _extract_wu_token
+
+        body = "try{umx.wu('T2gAv_abc123xyz');}catch(e){} try{__fycb('T2gAv_other');}catch(e){}"
+        assert _extract_wu_token(body) == "T2gAv_abc123xyz"
+
+
+class TestQwenWireShapes:
+    """Request shapes per the qwen2api reference (core.js)."""
+
+    @patch("aiohttp.ClientSession.post")
+    def test_create_posts_full_body_and_headers(self, mock_http, mock_cookies):
+        """chats/new is a POST with title/models/chat_mode + bx headers."""
+        mock_response = AsyncMock()
+        mock_response.status = 200
+        mock_response.json = AsyncMock(return_value={"success": True, "data": {"id": "c1"}})
+        mock_http.return_value.__aenter__.return_value = mock_response
+
+        asyncio.run(create_new_chat("eyJtok", "qwen3-max"))
+
+        _, kwargs = mock_http.call_args
+        sent = json.loads(kwargs["json"]) if isinstance(kwargs.get("json"), str) else kwargs.get("json")
+        assert sent["models"] == ["qwen3-max"]
+        assert sent["chat_mode"] == "normal"
+        assert "timestamp" in sent
+        headers = kwargs["headers"]
+        assert headers["bx-umidtoken"] == "T2gAv_test-baxia"
+        assert headers["source"] == "web"
+        assert "x-request-id" in headers
+        assert mock_http.call_args[0][0].endswith("/chats/new")
+
+    @patch("aiohttp.ClientSession.post")
+    def test_completions_uses_query_param_and_message_envelope(self, mock_http, mock_cookies):
+        """completions POSTs to ?chat_id= with the fid/childrenIds envelope."""
+        mock_response = AsyncMock()
+        mock_response.status = 200
+        mock_response.content = _sse([b"data: [DONE]\n\n"])
+        mock_http.return_value.__aenter__.return_value = mock_response
+
+        async def collect():
+            async for _ in send_message(auth_token="eyJtok", chat_id="chat-9", message="hi"):
+                pass
+
+        asyncio.run(collect())
+
+        url = mock_http.call_args[0][0]
+        assert url.endswith("/chat/completions?chat_id=chat-9")
+        sent = mock_http.call_args[1]["json"]
+        assert sent["chat_mode"] == "normal"
+        assert sent["version"] == "2.1"
+        msg = sent["messages"][0]
+        assert msg["role"] == "user" and msg["content"] == "hi"
+        assert "fid" in msg and "childrenIds" in msg

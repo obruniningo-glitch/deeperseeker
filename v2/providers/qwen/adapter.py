@@ -80,8 +80,8 @@ class QwenAdapter(ProviderAdapter):
                 token_id=resume.token_id,
             )
 
-        # Create new chat session
-        chat_id = await create_new_chat(token)
+        # Create new chat session (default model; send() re-resolves per request)
+        chat_id = await create_new_chat(token, "qwen3-max")
         return SessionRef(
             provider=self.name,
             chat_id=chat_id,

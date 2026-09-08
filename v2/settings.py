@@ -29,6 +29,8 @@ class Settings(BaseSettings):
     QWEN_COOKIE_PATH: str = Field(default="aws_cookies_qwen.json",
                                    validation_alias=AliasChoices("QWEN_COOKIE_PATH", "DEEPSEEKER_QWEN_COOKIE_PATH"))
     QWEN_TOKEN: str = Field(default="", validation_alias=AliasChoices("QWEN_TOKEN", "DEEPSEEKER_QWEN_TOKEN"))
+    QWEN_USER_AGENT: str = ""
+    QWEN_ACCEPT_LANGUAGE: str = ""
 
     # Cache / compaction (v2 owns the same knobs as v1 for behavior parity)
     SIG_WINDOW_K: int = 8
